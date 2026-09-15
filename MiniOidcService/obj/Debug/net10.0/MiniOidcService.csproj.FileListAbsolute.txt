@@ -1,0 +1,14 @@
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/bin/Debug/net10.0/MiniOidcService
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/bin/Debug/net10.0/MiniOidcService.deps.json
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/bin/Debug/net10.0/MiniOidcService.runtimeconfig.json
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/bin/Debug/net10.0/MiniOidcService.dll
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/bin/Debug/net10.0/MiniOidcService.pdb
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/MiniOidcService.GeneratedMSBuildEditorConfig.editorconfig
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/MiniOidcService.AssemblyInfoInputs.cache
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/MiniOidcService.AssemblyInfo.cs
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/MiniOidcService.csproj.CoreCompileInputs.cache
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/MiniOidcService.dll
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/refint/MiniOidcService.dll
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/MiniOidcService.pdb
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/MiniOidcService.genruntimeconfig.cache
+/home/mark/source/repos/OAuth+OIDC/MiniOidcService/obj/Debug/net10.0/ref/MiniOidcService.dll

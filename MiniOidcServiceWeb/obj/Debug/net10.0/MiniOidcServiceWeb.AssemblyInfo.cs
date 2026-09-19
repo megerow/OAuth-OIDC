@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MiniOidcServiceWeb")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+44199f8a643bb3c5a45db4c294bbb01728004d35")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+fdd4eebbb1079148ab920a7d00ecb6d846eb6c4a")]
 [assembly: System.Reflection.AssemblyProductAttribute("MiniOidcServiceWeb")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MiniOidcServiceWeb")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

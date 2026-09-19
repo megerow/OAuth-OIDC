@@ -10,6 +10,7 @@ Everything is a **mock for learning**. State is in memory, passwords are plainte
 |---|---|---|---|
 | **MiniOidcService** | Console app | n/a | Step-zero demo: builds and signs a JWT with a fresh RSA key and prints it (paste into jwt.io). Standalone, not used by the others. |
 | **MiniOidcServiceWeb** | ASP.NET minimal API | `http://localhost:5121` | The **identity provider**. Shows a login form, issues signed JWTs, publishes its public keys and metadata, and supports dynamic client registration. |
+| **MiniOidcIdp** | ASP.NET minimal API | `http://localhost:5121` | An alternative **identity provider** with pluggable sign-in (fake users, or Windows authentication) and group-to-role mapping you can edit in a browser. Same endpoints as MiniOidcServiceWeb, so run one or the other. See [MiniOidcIdp](#minioidcidp-role-mapping-and-windows-sign-in). |
 | **MiniOidcClient** | Console app | listens on `http://localhost:8080/callback/` | A **client application**. Opens your browser to log in, catches the redirect, exchanges the code for tokens, then calls the protected API. |
 | **MiniProtectedApi** | ASP.NET minimal API | `http://localhost:5062` | A **resource server**. Validates bearer tokens from the identity provider and enforces roles. |
 | **MiniMcpServer** | ASP.NET MCP server | `http://localhost:5046/mcp` | A protected **MCP server** (Streamable HTTP). Same token validation, plus the discovery documents MCP clients need. |
@@ -75,6 +76,31 @@ Step 8 is a two-way dotted arrow because it is a request and its response. MCP c
 **Mock users** (password `password123`): `jane.doe@example.com` has roles `Admin` and `BillingManager`. `john.smith@example.com` has only `BillingManager`.
 
 **Pre-registered client:** `my_learning_client_app` with redirect `http://localhost:8080/callback/`.
+
+## MiniOidcIdp: role mapping and Windows sign-in
+
+MiniOidcIdp is meant for setups where users already sign in with Windows (NTLM or Kerberos) and downstream services can't receive that identity directly. The IdP does the Windows sign-in once and issues tokens the other services can validate. It changes two things compared with MiniOidcServiceWeb:
+
+1. **Where the user comes from** (`Idp:AuthenticationMode` in `appsettings.json`):
+
+   | Mode | Sign-in | Use for |
+   |---|---|---|
+   | `Persona` (default) | The login form, checked against fake users in `Idp:Personas` | Linux, or any development without Windows auth |
+   | `WindowsKestrel` | Windows authentication through the Negotiate handler, no form | Windows development on Kestrel |
+   | `WindowsIis` | Windows authentication done by IIS, no form | The IIS deployment |
+
+2. **Where roles come from:** the token's `roles` are not hardcoded. Each user's groups (AD, local, or persona groups) are matched against `Idp:RoleMappings`, for example `DEMO\App-Billing` to `BillingManager`. A mapping's group can be a name (`DOMAIN\Group`) or a SID. A SID survives a group rename.
+
+Other differences: the token `sub` is the user's SID, and a `preferred_username` claim carries the account name.
+
+**Admin page:** `http://localhost:5121/admin/roles` (raw JSON at `/admin/roles.json`). For each user it shows their groups, which mappings matched, and the roles that go into their token. It also lets you add and remove mappings, with a shortcut to map a group you can see in the list.
+- It is on by default only in Development (`Idp:EnableAdminUi`).
+- Roles are worked out at sign-in, so an edit affects new sign-ins only. Tokens already issued keep their old roles until they expire.
+- Edits are saved to `role-mappings.json` (in `%LOCALAPPDATA%\MiniOidc` or `~/.local/share/MiniOidc`, or the path in `Idp:MappingsFile`). That file overrides the mappings in `appsettings.json`. Delete it to go back to them.
+- In Windows modes, only members of `Idp:AdminGroup` can edit, and if it is empty nobody can. Every edit needs an anti-forgery token, since a browser sends Windows credentials automatically, and each edit is logged with who made it.
+- To find your real group names, sign in to the admin page on the deployed site and read the group list.
+
+**Testing status:** Persona mode is tested (roles, editing, persistence, and against MiniProtectedApi and MiniMcpServer unchanged). The two Windows modes compile but have not been run, because that needs a Windows machine. On a non-Windows machine they refuse to start.
 
 ## Tokens
 
@@ -178,6 +204,8 @@ dotnet run --project MiniProtectedApi   --urls http://localhost:5062   # REST AP
 dotnet run --project MiniMcpServer      --urls http://localhost:5046   # MCP server
 dotnet run --project MiniOidcClient                                    # opens browser, click Sign In
 ```
+
+To use MiniOidcIdp instead, start it in place of MiniOidcServiceWeb (both use port 5121): `dotnet run --project MiniOidcIdp --urls http://localhost:5121`.
 
 The client prints the token response, then the result of `/api/public`, `/api/admin-dashboard` and `/api/billing`.
 

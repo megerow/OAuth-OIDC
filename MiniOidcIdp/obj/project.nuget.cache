@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "f3YzJMQiXtA=",
+  "success": true,
+  "projectFilePath": "/home/mark/source/repos/OAuth+OIDC/MiniOidcIdp/MiniOidcIdp.csproj",
+  "expectedPackageFiles": [
+    "/home/mark/.nuget/packages/microsoft.aspnetcore.authentication.negotiate/10.0.12/microsoft.aspnetcore.authentication.negotiate.10.0.12.nupkg.sha512",
+    "/home/mark/.nuget/packages/system.directoryservices.protocols/10.0.12/system.directoryservices.protocols.10.0.12.nupkg.sha512"
+  ],
+  "logs": []
+}

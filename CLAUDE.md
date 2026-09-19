@@ -16,12 +16,12 @@ A learning sandbox for OAuth 2.0 / OIDC in .NET 10. See [README.md](README.md) f
 | MiniMcpServer | 5046 |
 | MiniOidcClient (callback listener) | 8080 |
 
-Start the identity provider first. Downstream projects read `Authority` from config (default `http://localhost:5121`), and MiniMcpServer also reads `Resource`. Token `iss` follows the request address, so the authority must match how the IdP is reached.
+Start the identity provider first. MiniProtectedApi and MiniMcpServer read an `Auth` section from `appsettings.json` (`Authority`, `Audience`, `RoleClaimType`, and for MCP also `Resource` and `Scopes`). Override with environment variables such as `Auth__Authority`. Token `iss` follows the request address, so the authority must match how the IdP is reached.
 
 ## Habits that saved time
 
 - **Leftover background servers hold ports.** Check with `ss -tlnp | grep -E ':(5121|5062|5046|8080)\b'` and free one with `fuser -k <port>/tcp`. Match the real process name (`MiniOidcService`), not `dotnet`.
-- **Test on temporary ports** so a running instance isn't disturbed: `dotnet run --no-build --urls http://localhost:5400` with `Authority=...` and `Resource=...` set for the API and MCP server.
+- **Test on temporary ports** so a running instance isn't disturbed: `dotnet run --no-build --urls http://localhost:5400` with `Auth__Authority=...` set for the API and MCP server, plus `Auth__Audience=...` and `Auth__Resource=...` for the MCP server (its default port 5046 is often already taken by a running instance, which makes a new copy fail to start and hides that in test results).
 - The OAuth interop test for the MCP server used the official `ModelContextProtocol` SDK client (`HttpClientTransport` with `ClientOAuthOptions`, dynamic registration, and a redirect delegate that submits the login form). It lived outside the repo and isn't saved here. Rebuild it if needed.
 - Mermaid diagrams in the README can be parse-checked with the `mermaid` npm package and rendered with `@mermaid-js/mermaid-cli` using the system Chrome.
 

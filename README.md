@@ -131,6 +131,42 @@ Both are RS256 JWTs carrying `iss`, `sub` (email), `name`, `roles`, `exp`, `iat`
 
 Tools the caller isn't allowed to use are hidden from their tool list and rejected if called directly.
 
+## Configuring which identity provider to trust
+
+MiniProtectedApi and MiniMcpServer read an `Auth` section from their `appsettings.json`, so pointing them at a different identity provider (Entra ID, Okta, and so on) is a configuration change. They refuse to start if `Authority` or `Audience` is missing.
+
+| Setting | Meaning | Default in the repo |
+|---|---|---|
+| `Authority` | The provider's issuer URL. Its discovery document and signing keys are found from here. | `http://localhost:5121` |
+| `Audience` | What the token's `aud` claim must be, meaning the token was issued for this service. | API: `my_learning_client_app`. MCP: `http://localhost:5046`. |
+| `RoleClaimType` | The token claim that holds roles. | `roles` |
+| `RequireHttpsMetadata` | Requires the provider's URLs to be HTTPS. Leave it `true` (the code default) for real providers. | `false` in `appsettings.json` for local HTTP |
+| `MetadataRefreshSeconds` | How quickly signing keys are refetched after an unknown key. Only useful for the mock IdP, which makes a new key on every restart. Leave it out for real providers. | `5` |
+| `Resource` (MCP only) | This server's own address, published to MCP clients. Defaults to `Audience`. | `http://localhost:5046` |
+| `Scopes` (MCP only) | Scopes advertised to MCP clients. | `mcp:tools` |
+
+Override any setting without editing the file by using an environment variable with `__` between the parts, for example `Auth__Authority=http://localhost:5400`. `Auth__Scopes__0=mcp:tools` sets the first scope.
+
+Illustrative values for other providers (verify in your tenant, since these depend on how the app registration is set up):
+
+```jsonc
+// Entra ID
+"Auth": {
+  "Authority": "https://login.microsoftonline.com/<tenant-id>/v2.0",
+  "Audience": "api://<api-app-id>",
+  "RoleClaimType": "roles"
+}
+
+// Okta (custom authorization server)
+"Auth": {
+  "Authority": "https://<org>.okta.com/oauth2/<server-id>",
+  "Audience": "<audience set on the authorization server>",
+  "RoleClaimType": "groups"
+}
+```
+
+Config alone is not the whole swap. MiniOidcClient still has the mock IdP's endpoints, client ID and redirect URI hardcoded and sends the `id_token` to the API, and MCP clients expect dynamic client registration that real providers often restrict. `RequireHttpsMetadata` and `MetadataRefreshSeconds` should be removed from the API and MCP `appsettings.json` when you switch.
+
 ## Authentication flow
 
 Authorization code flow with PKCE. MCP clients also do the discovery and registration steps first. MiniOidcClient skips them because it is pre-registered and its URLs are hardcoded.

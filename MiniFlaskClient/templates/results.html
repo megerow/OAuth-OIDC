@@ -40,7 +40,7 @@
     <a class="button" href="{{ url_for('results') }}">Call again</a>
     {% if has_refresh_token %}<form method="post" action="{{ url_for('refresh_now') }}" style="display:inline"><button class="button" type="submit" style="border:none; cursor:pointer; font-size:1em">Refresh tokens now</button></form>{% endif %}
     <a class="button secondary" href="{{ url_for('home') }}">Home</a>
-    <a class="button secondary" href="{{ url_for('logout') }}">Sign out</a>
+    <form method="post" action="{{ url_for('logout') }}" style="display:inline"><button class="button secondary" type="submit" style="border:none; cursor:pointer; font-size:1em">Sign out</button></form>
   </p>
   <p class="muted">The roles come from the IdP's group mappings. If a change was made since you signed in, sign out and in again to get a new token.</p>
 {% endblock %}

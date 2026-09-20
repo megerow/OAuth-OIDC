@@ -12,6 +12,15 @@ class IdpOptions
     public bool EnableAdminUi { get; set; }
     public string? AdminGroup { get; set; }
     public string? MappingsFile { get; set; }
+
+    // When set, this is the issuer in every token and in the metadata. Otherwise it is taken from the request's address,
+    // which is only safe when nothing can send a made-up Host header (and needs care behind a load balancer).
+    public string? Issuer { get; set; }
+
+    // Turn off /register to stop strangers adding clients (and rows) to the IdP
+    public bool AllowDynamicClientRegistration { get; set; } = true;
+
+    public List<ClientOptions> Clients { get; set; } = new();
     public List<RoleMapping> RoleMappings { get; set; } = new();
     public List<Persona> Personas { get; set; } = new();
 }
@@ -102,8 +111,32 @@ static class IdpUsers
     }
 }
 
-// Holds the group-to-role mappings, seeded from configuration and saved to a file when edited
-partial class RoleMappingStore
+// The rules for a mapping, shared by every store so a file and a database accept exactly the same input
+static partial class RoleMappingRules
+{
+    // Returns an error message, or null when the mapping is acceptable
+    public static string? Validate(RoleMapping mapping)
+    {
+        if (string.IsNullOrWhiteSpace(mapping.Group) || mapping.Group.Length > 256 || mapping.Group.Any(char.IsControl))
+        {
+            return "Group is required (up to 256 characters).";
+        }
+
+        if (!RoleName().IsMatch(mapping.Role))
+        {
+            return "Role must be 1-64 characters: letters, digits, and _ . : -";
+        }
+
+        return null;
+    }
+
+    [GeneratedRegex("^[A-Za-z0-9_.:-]{1,64}$")]
+    private static partial Regex RoleName();
+}
+
+// Holds the group-to-role mappings in a JSON file. It starts from the configured mappings, and edits made through the admin page
+// are saved to the file, which then wins over the configured defaults. Used when no database is configured.
+sealed class FileRoleMappingStore : IRoleMappingStore
 {
     static readonly JsonSerializerOptions FileJson = new() { WriteIndented = true };
 
@@ -111,56 +144,54 @@ partial class RoleMappingStore
     readonly string path;
     List<RoleMapping> mappings;
 
-    public RoleMappingStore(IEnumerable<RoleMapping> configured, string path)
+    public FileRoleMappingStore(IEnumerable<RoleMapping> configured, string path)
     {
         this.path = path;
         mappings = configured.ToList();
 
-        // Edits made through the admin page live in the file and win over the configured defaults
         if (File.Exists(path))
         {
             mappings = JsonSerializer.Deserialize<List<RoleMapping>>(File.ReadAllText(path)) ?? mappings;
         }
     }
 
-    public IReadOnlyList<RoleMapping> Snapshot()
+    public Task<IReadOnlyList<RoleMapping>> SnapshotAsync()
     {
         lock (gate)
         {
-            return mappings.ToList();
+            return Task.FromResult<IReadOnlyList<RoleMapping>>(mappings.ToList());
         }
     }
 
-    // Returns an error message, or null on success
-    public string? Add(RoleMapping mapping)
+    public Task<string?> AddAsync(RoleMapping mapping)
     {
-        var error = Validate(mapping);
+        var error = RoleMappingRules.Validate(mapping);
         if (error != null)
         {
-            return error;
+            return Task.FromResult<string?>(error);
         }
 
         lock (gate)
         {
             if (mappings.Contains(mapping))
             {
-                return "That mapping already exists.";
+                return Task.FromResult<string?>("That mapping already exists.");
             }
 
-            return Save(mappings.Append(mapping).ToList());
+            return Task.FromResult(Save(mappings.Append(mapping).ToList()));
         }
     }
 
-    public string? Remove(RoleMapping mapping)
+    public Task<string?> RemoveAsync(RoleMapping mapping)
     {
         lock (gate)
         {
             if (!mappings.Contains(mapping))
             {
-                return "That mapping no longer exists.";
+                return Task.FromResult<string?>("That mapping no longer exists.");
             }
 
-            return Save(mappings.Where(m => m != mapping).ToList());
+            return Task.FromResult(Save(mappings.Where(m => m != mapping).ToList()));
         }
     }
 
@@ -180,22 +211,4 @@ partial class RoleMappingStore
             return $"Could not save the mappings file ({path}): {ex.Message}";
         }
     }
-
-    static string? Validate(RoleMapping mapping)
-    {
-        if (string.IsNullOrWhiteSpace(mapping.Group) || mapping.Group.Length > 256 || mapping.Group.Any(char.IsControl))
-        {
-            return "Group is required (up to 256 characters).";
-        }
-
-        if (!RoleName().IsMatch(mapping.Role))
-        {
-            return "Role must be 1-64 characters: letters, digits, and _ . : -";
-        }
-
-        return null;
-    }
-
-    [GeneratedRegex("^[A-Za-z0-9_.:-]{1,64}$")]
-    private static partial Regex RoleName();
 }

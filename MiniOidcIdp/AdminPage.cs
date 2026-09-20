@@ -5,7 +5,7 @@ using Microsoft.AspNetCore.Antiforgery;
 // Server-rendered HTML for /admin/roles. Every dynamic value goes through Html() because group names come from the directory.
 static class AdminPage
 {
-    public static string Render(IdpMode mode, IReadOnlyList<UserReport> users, IReadOnlyList<RoleMapping> mappings, bool canEdit, string? adminGroup, AntiforgeryTokenSet tokens, string? notice)
+    public static string Render(IdpMode mode, IReadOnlyList<UserReport> users, IReadOnlyList<RoleMapping> mappings, IReadOnlyList<ActiveSession>? sessions, bool canEdit, string? adminGroup, AntiforgeryTokenSet tokens, string? notice)
     {
         static string Html(string? s) => WebUtility.HtmlEncode(s ?? "");
 
@@ -84,6 +84,34 @@ static class AdminPage
             sb.Append("</tr>");
         }
         sb.Append("</table>");
+
+        if (sessions != null)
+        {
+            sb.Append("<h2>Active sign-ins</h2>");
+            sb.Append("<p>Users holding a refresh token, which lets their application renew tokens without asking them to sign in again. Ending their sign-ins stops that within moments. ");
+            sb.Append("Access tokens already issued keep working until they expire.</p>");
+            if (sessions.Count == 0)
+            {
+                sb.Append("<p><i>None right now.</i></p>");
+            }
+            else
+            {
+                sb.Append("<table><tr><th>User</th><th>Sign-ins</th><th>Latest token issued</th>");
+                sb.Append(canEdit ? "<th></th></tr>" : "</tr>");
+                foreach (var session in sessions)
+                {
+                    sb.Append($"<tr><td>{Html(session.Name)} <small>({Html(session.Account)})</small></td><td>{session.SignIns}</td><td>{Html(session.LastIssued.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"))}</td>");
+                    if (canEdit)
+                    {
+                        sb.Append($@"<td><form class='inline' method='post' action='/admin/roles/sessions/revoke'>{tokenField}
+                            <input type='hidden' name='subject' value='{Html(session.Subject)}' />
+                            <button type='submit'>End sign-ins</button></form></td>");
+                    }
+                    sb.Append("</tr>");
+                }
+                sb.Append("</table>");
+            }
+        }
 
         if (canEdit)
         {

@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MiniOidcIdp")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+40acdcd6703b171f2afaff377e4f8fe3ba9704eb")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b3d84f09e674a7d67e113106c9f952198ff251b9")]
 [assembly: System.Reflection.AssemblyProductAttribute("MiniOidcIdp")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MiniOidcIdp")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

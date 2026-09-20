@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Cryptography;
 using System.Security.Principal;
@@ -7,13 +6,14 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Negotiate;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Server.IISIntegration;
 using Microsoft.AspNetCore.WebUtilities;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 0. Configuration: how users sign in, which groups map to which roles, and who may edit the mappings
+// 0. Configuration: how users sign in, which groups map to which roles, who may edit the mappings, and where state is kept
 var idp = builder.Configuration.GetSection("Idp").Get<IdpOptions>() ?? new IdpOptions();
 bool windowsMode = idp.AuthenticationMode != IdpMode.Persona;
 
@@ -32,46 +32,41 @@ else if (idp.AuthenticationMode == IdpMode.WindowsIis)
     builder.Services.AddAuthentication(IISDefaults.AuthenticationScheme);
 }
 
+// Stores for clients, codes, refresh tokens, role mappings and signing keys: in memory by default, or a database
+var persistence = builder.Services.AddIdpPersistence(builder.Configuration, idp);
 builder.Services.AddAntiforgery();
 
-string mappingsFile = idp.MappingsFile
-    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MiniOidc", "role-mappings.json");
-var roleMappings = new RoleMappingStore(idp.RoleMappings, mappingsFile);
-
 var app = builder.Build();
+
+// Creates the schema, seeds the role mappings and makes sure a signing key exists. Stops the IdP if anything is wrong.
+await app.Services.InitializeIdpPersistenceAsync(idp);
 
 if (windowsMode)
 {
     app.UseAuthentication();
 }
 
-app.Logger.LogInformation("Authentication mode: {Mode}. Role mappings file: {File}", idp.AuthenticationMode, mappingsFile);
+var clients = app.Services.GetRequiredService<IClientStore>();
+var codeStore = app.Services.GetRequiredService<IAuthorizationCodeStore>();
+var refreshStore = app.Services.GetRequiredService<IRefreshTokenStore>();
+var roleMappings = app.Services.GetRequiredService<IRoleMappingStore>();
+var keys = app.Services.GetRequiredService<ISigningKeyProvider>();
 
-// 1. Core State
-using RSA rsaKey = RSA.Create(2048);
-
-// Key ID derived from the public key, so a restart (new key) never reuses a stale kid
-var publicParams = rsaKey.ExportParameters(false);
-string kid = Base64UrlEncode(SHA256.HashData(publicParams.Modulus!))[..16];
-
-string IssuerFor(HttpRequest r) => $"{r.Scheme}://{r.Host}";
-string Html(string? s) => WebUtility.HtmlEncode(s ?? "");
-
-// Active login flows in progress (maps: temporary auth_code -> session details)
-var activeFlows = new ConcurrentDictionary<string, AuthFlowSession>();
-
-// Refresh tokens live only here, keyed by the opaque token string. Used tokens stay until they expire so a replay can be recognised.
-var refreshTokens = new ConcurrentDictionary<string, RefreshRecord>();
-object refreshLock = new();
+app.Logger.LogInformation("Authentication mode: {Mode}. State kept in: {Provider}", idp.AuthenticationMode, persistence.Provider == PersistenceProvider.None ? "memory" : persistence.Provider.ToString());
 
 int accessTokenSeconds = Math.Max(1, app.Configuration.GetValue<int>("Tokens:AccessTokenSeconds", 3600));
 int refreshTokenSeconds = Math.Max(1, app.Configuration.GetValue<int>("Tokens:RefreshTokenSeconds", 86400));
+int refreshTokenMaxSeconds = Math.Max(1, app.Configuration.GetValue<int>("Tokens:RefreshTokenMaxSeconds", 604800));
+int authorizationCodeSeconds = Math.Max(1, app.Configuration.GetValue<int>("Tokens:AuthorizationCodeSeconds", 300));
 
-// Registered clients (static + dynamically registered via /register): client_id -> exact redirect URIs allowed
-var registeredClients = new ConcurrentDictionary<string, HashSet<string>>
-{
-    ["my_learning_client_app"] = new() { "http://localhost:8080/callback/" }
-};
+const int MaxDynamicClients = 1000;
+const int MaxRedirectUris = 10;
+const int MaxUriLength = 2048;
+const int MaxClientNameLength = 200;
+
+string IssuerFor(HttpRequest r) =>
+    !string.IsNullOrWhiteSpace(idp.Issuer) ? idp.Issuer.TrimEnd('/') : $"{r.Scheme}://{r.Host}";
+string Html(string? s) => WebUtility.HtmlEncode(s ?? "");
 
 var indented = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true };
 
@@ -90,94 +85,157 @@ async Task<IdpUser?> AuthenticateWindowsAsync(HttpContext ctx)
 IResult ChallengeWindows() => Results.Challenge(authenticationSchemes: new[] { windowsScheme });
 
 // Authorization server metadata, served both as OIDC discovery and as RFC 8414 metadata (MCP clients look for either)
-object ServerMetadata(string issuer) => new
+object ServerMetadata(string issuer)
 {
-    issuer,
-    authorization_endpoint = $"{issuer}/authorize",
-    token_endpoint = $"{issuer}/token",
-    jwks_uri = $"{issuer}/.well-known/jwks.json",
-    registration_endpoint = $"{issuer}/register",
-    response_types_supported = new[] { "code" },
-    grant_types_supported = new[] { "authorization_code", "refresh_token" },
-    subject_types_supported = new[] { "public" },
-    id_token_signing_alg_values_supported = new[] { "RS256" },
-    code_challenge_methods_supported = new[] { "S256" },
-    token_endpoint_auth_methods_supported = new[] { "none" },
-    scopes_supported = new[] { "openid", "offline_access", "mcp:tools" }
-};
+    var metadata = new Dictionary<string, object>
+    {
+        ["issuer"] = issuer,
+        ["authorization_endpoint"] = $"{issuer}/authorize",
+        ["token_endpoint"] = $"{issuer}/token",
+        ["jwks_uri"] = $"{issuer}/.well-known/jwks.json",
+        ["revocation_endpoint"] = $"{issuer}/revoke",
+        ["revocation_endpoint_auth_methods_supported"] = new[] { "none" },
+        ["end_session_endpoint"] = $"{issuer}/logout",
+        ["response_types_supported"] = new[] { "code" },
+        ["grant_types_supported"] = new[] { "authorization_code", "refresh_token" },
+        ["subject_types_supported"] = new[] { "public" },
+        ["id_token_signing_alg_values_supported"] = new[] { "RS256" },
+        ["code_challenge_methods_supported"] = new[] { "S256" },
+        ["token_endpoint_auth_methods_supported"] = new[] { "none" },
+        ["scopes_supported"] = new[] { "openid", "offline_access", "mcp:tools" }
+    };
+
+    if (idp.AllowDynamicClientRegistration)
+    {
+        metadata["registration_endpoint"] = $"{issuer}/register";
+    }
+
+    return metadata;
+}
 
 app.MapGet("/.well-known/openid-configuration", (HttpRequest request) => Results.Json(ServerMetadata(IssuerFor(request))));
 app.MapGet("/.well-known/oauth-authorization-server", (HttpRequest request) => Results.Json(ServerMetadata(IssuerFor(request))));
 
-// Public signing key (JWK) used to verify the RS256 signature on issued tokens
-app.MapGet("/.well-known/jwks.json", () => Results.Json(new
+// Public signing keys (JWK) used to verify the RS256 signature on issued tokens. During a rotation this lists more than one.
+app.MapGet("/.well-known/jwks.json", async () =>
 {
-    keys = new[]
+    var published = await keys.GetPublishedAsync();
+    return Results.Json(new
     {
-        new
-        {
-            kty = "RSA",
-            use = "sig",
-            alg = "RS256",
-            kid,
-            n = Base64UrlEncode(publicParams.Modulus!),
-            e = Base64UrlEncode(publicParams.Exponent!)
-        }
-    }
-}));
+        keys = published.Select(k => new { kty = "RSA", use = "sig", alg = "RS256", kid = k.Kid, n = k.Modulus, e = k.Exponent })
+    });
+});
 
 // Dynamic Client Registration (RFC 7591): public clients register their redirect URIs and receive a client_id
 app.MapPost("/register", async (HttpContext context) =>
 {
-    JsonElement body;
+    if (!idp.AllowDynamicClientRegistration)
+    {
+        return Results.NotFound();
+    }
+
+    // The endpoint is open to anyone, so keep what it accepts small
+    var bodyLimit = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+    if (bodyLimit is { IsReadOnly: false })
+    {
+        bodyLimit.MaxRequestBodySize = 32 * 1024;
+    }
+
+    JsonDocument document;
     try
     {
-        body = (await JsonDocument.ParseAsync(context.Request.Body)).RootElement;
+        document = await JsonDocument.ParseAsync(context.Request.Body);
     }
     catch (JsonException)
     {
         return Results.Json(new { error = "invalid_client_metadata", error_description = "Body must be JSON" }, statusCode: 400);
     }
 
-    if (body.ValueKind != JsonValueKind.Object ||
-        !body.TryGetProperty("redirect_uris", out var uris) || uris.ValueKind != JsonValueKind.Array || uris.GetArrayLength() == 0)
+    using (document)
     {
-        return Results.Json(new { error = "invalid_redirect_uri", error_description = "redirect_uris is required" }, statusCode: 400);
-    }
-
-    var redirectUris = new HashSet<string>();
-    foreach (var element in uris.EnumerateArray())
-    {
-        string? uri = element.ValueKind == JsonValueKind.String ? element.GetString() : null;
-        if (!IsAcceptableRedirectUri(uri))
+        var body = document.RootElement;
+        if (body.ValueKind != JsonValueKind.Object)
         {
-            return Results.Json(new { error = "invalid_redirect_uri", error_description = "Redirect URIs must be absolute https URIs or http loopback URIs, without fragments" }, statusCode: 400);
+            return Results.Json(new { error = "invalid_client_metadata", error_description = "Body must be a JSON object" }, statusCode: 400);
         }
-        redirectUris.Add(uri!);
+
+        string? clientName = body.TryGetProperty("client_name", out var nameElement) && nameElement.ValueKind == JsonValueKind.String ? nameElement.GetString() : null;
+        if (clientName is { Length: > MaxClientNameLength })
+        {
+            return Results.Json(new { error = "invalid_client_metadata", error_description = $"client_name is limited to {MaxClientNameLength} characters" }, statusCode: 400);
+        }
+
+        var redirectUris = ReadUriList(body, "redirect_uris", out var redirectError);
+        if (redirectUris == null || redirectUris.Count == 0)
+        {
+            return Results.Json(new { error = "invalid_redirect_uri", error_description = redirectError ?? "redirect_uris is required" }, statusCode: 400);
+        }
+
+        var postLogoutUris = ReadUriList(body, "post_logout_redirect_uris", out var postLogoutError) ?? [];
+        if (postLogoutError != null)
+        {
+            return Results.Json(new { error = "invalid_client_metadata", error_description = postLogoutError }, statusCode: 400);
+        }
+
+        string clientId = "client_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
+        if (!await clients.TryRegisterAsync(new ClientInfo(clientId, redirectUris, postLogoutUris), clientName, MaxDynamicClients))
+        {
+            return Results.Json(new { error = "invalid_client_metadata", error_description = "The limit on registered clients has been reached" }, statusCode: 400);
+        }
+
+        return Results.Json(new
+        {
+            client_id = clientId,
+            client_id_issued_at = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            client_name = clientName,
+            redirect_uris = redirectUris,
+            post_logout_redirect_uris = postLogoutUris,
+            token_endpoint_auth_method = "none",
+            grant_types = new[] { "authorization_code", "refresh_token" },
+            response_types = new[] { "code" }
+        }, statusCode: 201);
+    }
+});
+
+// Reads an optional array of redirect-style URIs. Returns null with an error message when a value is not acceptable.
+List<string>? ReadUriList(JsonElement body, string name, out string? error)
+{
+    error = null;
+    var list = new List<string>();
+    if (!body.TryGetProperty(name, out var element))
+    {
+        return list;
     }
 
-    string clientId = "client_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
-    registeredClients[clientId] = redirectUris;
-
-    string? clientName = body.TryGetProperty("client_name", out var nameElement) && nameElement.ValueKind == JsonValueKind.String ? nameElement.GetString() : null;
-
-    return Results.Json(new
+    if (element.ValueKind != JsonValueKind.Array || element.GetArrayLength() > MaxRedirectUris)
     {
-        client_id = clientId,
-        client_id_issued_at = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-        client_name = clientName,
-        redirect_uris = redirectUris,
-        token_endpoint_auth_method = "none",
-        grant_types = new[] { "authorization_code", "refresh_token" },
-        response_types = new[] { "code" }
-    }, statusCode: 201);
-});
+        error = $"{name} must be an array of at most {MaxRedirectUris} URIs";
+        return null;
+    }
+
+    foreach (var item in element.EnumerateArray())
+    {
+        string? uri = item.ValueKind == JsonValueKind.String ? item.GetString() : null;
+        if (uri is not { Length: <= MaxUriLength } || !IsAcceptableRedirectUri(uri))
+        {
+            error = $"{name} must hold absolute https URIs or http loopback URIs, without fragments, of at most {MaxUriLength} characters";
+            return null;
+        }
+
+        if (!list.Contains(uri))
+        {
+            list.Add(uri);
+        }
+    }
+
+    return list;
+}
 
 // 2. Endpoint: The Initial OIDC Redirection Trigger (Step 1 & 2 of the Flow)
 app.MapGet("/authorize", async (HttpContext context, [FromQuery] string client_id, [FromQuery] string redirect_uri, [FromQuery] string code_challenge, [FromQuery] string code_challenge_method,
     [FromQuery] string? resource, [FromQuery] string? scope, [FromQuery] string? state) =>
 {
-    var error = ValidateAuthorizationRequest(client_id, redirect_uri, code_challenge_method, resource);
+    var error = await ValidateAuthorizationRequestAsync(client_id, redirect_uri, code_challenge_method, resource);
     if (error != null)
     {
         return error;
@@ -192,7 +250,7 @@ app.MapGet("/authorize", async (HttpContext context, [FromQuery] string client_i
             return ChallengeWindows();
         }
 
-        return IssueCode(user, client_id, redirect_uri, code_challenge, NullIfEmpty(resource), NullIfEmpty(scope), NullIfEmpty(state));
+        return await IssueCodeAsync(user, client_id, redirect_uri, code_challenge, NullIfEmpty(resource), NullIfEmpty(scope), NullIfEmpty(state));
     }
 
     // Persona mode: the login form, prefilled with the first persona so a first-time visitor can just click the button
@@ -259,7 +317,7 @@ app.MapPost("/login", async (HttpContext context) =>
     string? state = NullIfEmpty(form["state"].ToString());
 
     // The form fields are attacker-controllable, so the request is validated again here, not just at /authorize
-    var error = ValidateAuthorizationRequest(clientId, redirectUri, form["code_challenge_method"].ToString(), resource);
+    var error = await ValidateAuthorizationRequestAsync(clientId, redirectUri, form["code_challenge_method"].ToString(), resource);
     if (error != null || string.IsNullOrEmpty(codeChallenge))
     {
         return error ?? Results.BadRequest(new { error = "invalid_request", error_description = "code_challenge is required" });
@@ -273,20 +331,21 @@ app.MapPost("/login", async (HttpContext context) =>
         return LoginForm(clientId, redirectUri, codeChallenge, form["code_challenge_method"].ToString(), resource, scope, state, email, "", "Incorrect email or password.");
     }
 
-    return IssueCode(IdpUsers.FromPersona(persona), clientId, redirectUri, codeChallenge, resource, scope, state);
+    return await IssueCodeAsync(IdpUsers.FromPersona(persona), clientId, redirectUri, codeChallenge, resource, scope, state);
 });
 
 // Creates the one-time authorization code for a signed-in user and redirects back to the client
-IResult IssueCode(IdpUser user, string clientId, string redirectUri, string codeChallenge, string? resource, string? scope, string? state)
+async Task<IResult> IssueCodeAsync(IdpUser user, string clientId, string redirectUri, string codeChallenge, string? resource, string? scope, string? state)
 {
     // Groups become application roles here, at sign-in, using the current mapping table
-    string[] roles = IdpUsers.ResolveRoles(user, roleMappings.Snapshot());
+    string[] roles = IdpUsers.ResolveRoles(user, await roleMappings.SnapshotAsync());
 
     // Generate a secure, randomized one-time authorization code
     string authorizationCode = "auth_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
 
-    // Save the workflow data in memory to match up during the subsequent /token exchange
-    activeFlows[authorizationCode] = new AuthFlowSession(clientId, redirectUri, codeChallenge, user.Subject, user.Account, user.Name, roles, resource, scope);
+    // Keep what it stands for until the client trades it in at /token, or it expires
+    await codeStore.SaveAsync(authorizationCode, new AuthFlowSession(clientId, redirectUri, codeChallenge, user.Subject, user.Account, user.Name, roles, resource, scope),
+        DateTimeOffset.UtcNow.AddSeconds(authorizationCodeSeconds));
 
     // Redirect the browser window straight back to the client application with the code (and the client's state, if any)
     var callbackParams = new Dictionary<string, string?> { ["code"] = authorizationCode };
@@ -305,8 +364,8 @@ app.MapPost("/token", async (HttpContext context) =>
     var form = await context.Request.ReadFormAsync();
     return form["grant_type"].ToString() switch
     {
-        "" or "authorization_code" => ExchangeAuthorizationCode(context, form),
-        "refresh_token" => ExchangeRefreshToken(context, form),
+        "" or "authorization_code" => await ExchangeAuthorizationCodeAsync(context, form),
+        "refresh_token" => await ExchangeRefreshTokenAsync(context, form),
         _ => TokenError("unsupported_grant_type", "Supported grants: authorization_code, refresh_token")
     };
 });
@@ -317,7 +376,7 @@ IResult TokenError(string error, string description) =>
 string[] SplitScopes(string? scope) =>
     string.IsNullOrWhiteSpace(scope) ? [] : scope.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
-IResult ExchangeAuthorizationCode(HttpContext context, IFormCollection form)
+async Task<IResult> ExchangeAuthorizationCodeAsync(HttpContext context, IFormCollection form)
 {
     string? code = form["code"];
     string? codeVerifier = form["code_verifier"];
@@ -327,15 +386,14 @@ IResult ExchangeAuthorizationCode(HttpContext context, IFormCollection form)
         return TokenError("invalid_request", "code and code_verifier are required");
     }
 
-    if (!activeFlows.TryGetValue(code, out var session))
+    var session = await codeStore.FindAsync(code);
+    if (session == null)
     {
-        return TokenError("invalid_grant", "Code not found");
+        return TokenError("invalid_grant", "Code not found or expired");
     }
 
     // PKCE Verification
-    using var sha256 = SHA256.Create();
-    string computedChallenge = Base64UrlEncode(sha256.ComputeHash(Encoding.UTF8.GetBytes(codeVerifier)));
-
+    string computedChallenge = Base64Url.Encode(SHA256.HashData(Encoding.UTF8.GetBytes(codeVerifier)));
     if (computedChallenge != session.CodeChallenge)
     {
         return TokenError("invalid_grant", "PKCE verification failed");
@@ -356,16 +414,19 @@ IResult ExchangeAuthorizationCode(HttpContext context, IFormCollection form)
         return TokenError("invalid_target", "resource does not match the authorization request");
     }
 
-    // Burn the code immediately so it's strictly single-use
-    activeFlows.TryRemove(code, out _);
+    // Burn the code so it is strictly single-use. If another request got there first, this one loses.
+    if (!await codeStore.ConsumeAsync(code))
+    {
+        return TokenError("invalid_grant", "Code not found or expired");
+    }
 
-    // Every refresh token issued from this login shares a family id, so a replayed one can revoke them all
-    return IssueTokens(context, session, Base64UrlEncode(RandomNumberGenerator.GetBytes(12)), null, tokenResource);
+    // Every refresh token issued from this login shares a family id, so a replayed one can revoke them all. The same id is the token's sid claim.
+    return await IssueTokensAsync(context, session, Base64Url.Encode(RandomNumberGenerator.GetBytes(12)), DateTimeOffset.UtcNow, null, tokenResource);
 }
 
 // Refresh grant (RFC 6749 section 6). Each refresh token works once: using it returns a new one in the same family.
 // Presenting one that was already used means it leaked, so the whole family is revoked (the OAuth security BCP's advice, and what Okta does).
-IResult ExchangeRefreshToken(HttpContext context, IFormCollection form)
+async Task<IResult> ExchangeRefreshTokenAsync(HttpContext context, IFormCollection form)
 {
     string presented = form["refresh_token"].ToString();
     string? clientId = NullIfEmpty(form["client_id"].ToString());
@@ -380,62 +441,51 @@ IResult ExchangeRefreshToken(HttpContext context, IFormCollection form)
     // One message for every way a refresh token can be unusable, so a caller learns nothing about which tokens exist
     IResult invalid = TokenError("invalid_grant", "The refresh token is invalid, expired or revoked");
 
-    AuthFlowSession original;
-    string familyId;
-    lock (refreshLock)
+    var record = await refreshStore.FindAsync(presented);
+    if (record == null || record.ExpiresAt <= DateTimeOffset.UtcNow || record.Session.ClientId != clientId)
     {
-        if (!refreshTokens.TryGetValue(presented, out var record))
-        {
-            return invalid;
-        }
-
-        if (record.ExpiresAt <= DateTimeOffset.UtcNow)
-        {
-            refreshTokens.TryRemove(presented, out _);
-            return invalid;
-        }
-
-        if (record.Session.ClientId != clientId)
-        {
-            return invalid;
-        }
-
-        if (record.Used)
-        {
-            RevokeFamily(record.FamilyId);
-            app.Logger.LogWarning("Refresh token reuse detected for {Account}: revoked all refresh tokens from that sign-in", record.Session.Account);
-            return invalid;
-        }
-
-        // A refresh may ask for fewer scopes than were granted, never more
-        if (requestedScope != null && !SplitScopes(requestedScope).All(SplitScopes(record.Session.Scope).Contains))
-        {
-            return TokenError("invalid_scope", "The requested scope exceeds the scope originally granted");
-        }
-
-        if (tokenResource != null && record.Session.Resource != null && tokenResource != record.Session.Resource)
-        {
-            return TokenError("invalid_target", "resource does not match the original authorization");
-        }
-
-        record.Used = true;
-        original = record.Session;
-        familyId = record.FamilyId;
-    }
-
-    var current = ReevaluateSession(original);
-    if (current == null)
-    {
-        RevokeFamily(familyId);
         return invalid;
     }
 
-    return IssueTokens(context, current, familyId, requestedScope, tokenResource);
+    if (record.Used)
+    {
+        await refreshStore.RevokeFamilyAsync(record.FamilyId);
+        app.Logger.LogWarning("Refresh token reuse detected for {Account}: revoked all refresh tokens from that sign-in", record.Session.Account);
+        return invalid;
+    }
+
+    // A refresh may ask for fewer scopes than were granted, never more
+    if (requestedScope != null && !SplitScopes(requestedScope).All(SplitScopes(record.Session.Scope).Contains))
+    {
+        return TokenError("invalid_scope", "The requested scope exceeds the scope originally granted");
+    }
+
+    if (tokenResource != null && record.Session.Resource != null && tokenResource != record.Session.Resource)
+    {
+        return TokenError("invalid_target", "resource does not match the original authorization");
+    }
+
+    // Only one request can flip the token to used. Losing that race looks exactly like a replay, so it is treated as one.
+    if (!await refreshStore.TryMarkUsedAsync(presented))
+    {
+        await refreshStore.RevokeFamilyAsync(record.FamilyId);
+        app.Logger.LogWarning("Refresh token used twice at once for {Account}: revoked all refresh tokens from that sign-in", record.Session.Account);
+        return invalid;
+    }
+
+    var current = await ReevaluateSessionAsync(record.Session);
+    if (current == null)
+    {
+        await refreshStore.RevokeFamilyAsync(record.FamilyId);
+        return invalid;
+    }
+
+    return await IssueTokensAsync(context, current, record.FamilyId, record.FamilyCreatedAt, requestedScope, tokenResource);
 }
 
 // Persona mode re-reads the user and the current role mappings at every refresh, so a role edit or a removed user takes effect without a new sign-in.
 // Windows modes cannot re-read group membership without the user's browser sign-in, so the roles from sign-in are kept until they sign in again.
-AuthFlowSession? ReevaluateSession(AuthFlowSession session)
+async Task<AuthFlowSession?> ReevaluateSessionAsync(AuthFlowSession session)
 {
     if (windowsMode)
     {
@@ -452,14 +502,15 @@ AuthFlowSession? ReevaluateSession(AuthFlowSession session)
     {
         Account = persona.Email,
         Name = persona.Name,
-        Roles = IdpUsers.ResolveRoles(IdpUsers.FromPersona(persona), roleMappings.Snapshot())
+        Roles = IdpUsers.ResolveRoles(IdpUsers.FromPersona(persona), await roleMappings.SnapshotAsync())
     };
 }
 
 // Builds the token response for either grant
-IResult IssueTokens(HttpContext context, AuthFlowSession session, string familyId, string? narrowedScope, string? tokenResource)
+async Task<IResult> IssueTokensAsync(HttpContext context, AuthFlowSession session, string familyId, DateTimeOffset familyCreatedAt, string? narrowedScope, string? tokenResource)
 {
     string issuer = IssuerFor(context.Request);
+    var signingKey = await keys.GetActiveAsync();
 
     // The access token is audience-bound to the protected resource the client asked for (RFC 8707); with no resource it falls back to the client
     string audience = session.Resource ?? tokenResource ?? session.ClientId;
@@ -473,10 +524,10 @@ IResult IssueTokens(HttpContext context, AuthFlowSession session, string familyI
     {
         accessTokenClaims["scope"] = string.Join(' ', apiScopes);
     }
-    string accessToken = GenerateJwtToken(rsaKey, issuer, audience, session, accessTokenClaims);
+    string accessToken = GenerateJwtToken(signingKey, issuer, audience, session, familyId, accessTokenClaims);
 
     // The id_token is for the client itself, so its audience is always the client_id
-    string idToken = GenerateJwtToken(rsaKey, issuer, session.ClientId, session);
+    string idToken = GenerateJwtToken(signingKey, issuer, session.ClientId, session, familyId);
 
     var response = new Dictionary<string, object>
     {
@@ -493,36 +544,156 @@ IResult IssueTokens(HttpContext context, AuthFlowSession session, string familyI
     // As with Entra ID and Okta, a refresh token is only issued when the client asked for the offline_access scope
     if (SplitScopes(session.Scope).Contains("offline_access"))
     {
-        response["refresh_token"] = NewRefreshToken(session, familyId);
+        // An opaque random string: the client cannot read it, and only this IdP knows what it stands for.
+        // Its lifetime slides (every refresh hands out a new one), but never past the cap counted from the original sign-in.
+        string refreshToken = "rt_" + Base64Url.Encode(RandomNumberGenerator.GetBytes(32));
+        var now = DateTimeOffset.UtcNow;
+        var expiresAt = Earlier(now.AddSeconds(refreshTokenSeconds), familyCreatedAt.AddSeconds(refreshTokenMaxSeconds));
+        await refreshStore.SaveAsync(refreshToken, session, familyId, familyCreatedAt, expiresAt);
+        response["refresh_token"] = refreshToken;
     }
 
     return Results.Json(response);
 }
 
-string NewRefreshToken(AuthFlowSession session, string familyId)
+DateTimeOffset Earlier(DateTimeOffset a, DateTimeOffset b) => a < b ? a : b;
+
+// Token revocation (RFC 7009). A public client hands back a refresh token it no longer wants, or suspects has leaked,
+// and every refresh token from that sign-in stops working. Access tokens are self-contained and simply expire.
+app.MapPost("/revoke", async (HttpContext context) =>
 {
-    var now = DateTimeOffset.UtcNow;
-    foreach (var expired in refreshTokens.Where(kv => kv.Value.ExpiresAt <= now).Select(kv => kv.Key).ToList())
+    context.Response.Headers.CacheControl = "no-store";
+
+    var form = await context.Request.ReadFormAsync();
+    string token = form["token"].ToString();
+    string? clientId = NullIfEmpty(form["client_id"].ToString());
+    string hint = form["token_type_hint"].ToString();
+
+    if (clientId == null || await clients.FindAsync(clientId) == null)
     {
-        refreshTokens.TryRemove(expired, out _);
+        return Results.Json(new { error = "invalid_client", error_description = "Unknown client_id" }, statusCode: StatusCodes.Status400BadRequest);
     }
 
-    // An opaque random string: the client cannot read it, and only this IdP knows what it stands for.
-    // Its lifetime slides: every refresh hands out a new token with a fresh full lifetime.
-    string token = "rt_" + Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
-    refreshTokens[token] = new RefreshRecord(session, familyId, now.AddSeconds(refreshTokenSeconds));
-    return token;
-}
-
-void RevokeFamily(string familyId)
-{
-    foreach (var key in refreshTokens.Where(kv => kv.Value.FamilyId == familyId).Select(kv => kv.Key).ToList())
+    if (token == "")
     {
-        refreshTokens.TryRemove(key, out _);
+        return TokenError("invalid_request", "token is required");
+    }
+
+    if (hint == "access_token" || token.Count(c => c == '.') == 2)
+    {
+        return TokenError("unsupported_token_type", "Only refresh tokens can be revoked. An access token stops working when it expires.");
+    }
+
+    // Unknown, expired, already revoked, or issued to another client: all answered the same way, so nothing is revealed
+    var record = await refreshStore.FindAsync(token);
+    if (record != null && record.Session.ClientId == clientId)
+    {
+        await refreshStore.RevokeFamilyAsync(record.FamilyId);
+        app.Logger.LogInformation("Refresh token revoked by client {Client} for {Account}", clientId, record.Session.Account);
+    }
+
+    return Results.Ok();
+});
+
+// Logout (OpenID Connect RP-Initiated Logout). The client sends the id_token it received. Its sid claim names the sign-in to end.
+app.MapMethods("/logout", new[] { "GET", "POST" }, async (HttpContext context) =>
+{
+    var form = context.Request.HasFormContentType ? await context.Request.ReadFormAsync() : null;
+    string? Param(string name)
+    {
+        string value = context.Request.Query[name].ToString();
+        if (value == "" && form != null)
+        {
+            value = form[name].ToString();
+        }
+        return NullIfEmpty(value);
+    }
+
+    string? hint = Param("id_token_hint");
+    string? requestedClient = Param("client_id");
+    string? postLogoutUri = Param("post_logout_redirect_uri");
+    string? state = Param("state");
+
+    // Without a valid hint nobody can be identified, so nothing is ended and nobody is redirected
+    var hinted = hint == null ? null : await ValidateIdTokenHintAsync(context.Request, hint);
+    if (hinted == null || (requestedClient != null && requestedClient != hinted.ClientId))
+    {
+        return SignedOutPage();
+    }
+
+    await refreshStore.RevokeFamilyAsync(hinted.Sid);
+    app.Logger.LogInformation("Logout: ended sign-in {Sid} for client {Client}", hinted.Sid, hinted.ClientId);
+
+    // Only a redirect address registered for this client is honoured, or the endpoint could be used to bounce people to any site
+    var client = await clients.FindAsync(hinted.ClientId);
+    if (postLogoutUri != null && client != null && client.PostLogoutRedirectUris.Contains(postLogoutUri))
+    {
+        return Results.Redirect(state == null ? postLogoutUri : QueryHelpers.AddQueryString(postLogoutUri, "state", state));
+    }
+
+    return SignedOutPage();
+});
+
+IResult SignedOutPage() => Results.Content($@"
+    <html>
+    <body style='font-family: sans-serif; max-width: 480px; margin: 50px auto; padding: 20px; border: 1px solid #ccc; border-radius: 8px;'>
+        <h2>Signed out</h2>
+        <p>You have signed out of the identity provider.</p>
+        {(windowsMode ? "<p>This IdP signs you in with your Windows account, so opening an application again may sign you straight back in.</p>" : "")}
+    </body>
+    </html>", "text/html");
+
+// Checks an id_token the IdP issued: its signature (against its own keys), issuer and audience. Expiry is deliberately ignored,
+// because a client logging out is often holding an id_token that has already expired.
+async Task<LogoutHint?> ValidateIdTokenHintAsync(HttpRequest request, string token)
+{
+    var parts = token.Split('.');
+    if (parts.Length != 3)
+    {
+        return null;
+    }
+
+    try
+    {
+        using var header = JsonDocument.Parse(Base64Url.Decode(parts[0]));
+        if (header.RootElement.GetProperty("alg").GetString() != "RS256")
+        {
+            return null;
+        }
+
+        string? kid = header.RootElement.TryGetProperty("kid", out var kidElement) ? kidElement.GetString() : null;
+        var rsa = kid == null ? null : await keys.GetVerificationKeyAsync(kid);
+        if (rsa == null || !rsa.VerifyData(Encoding.UTF8.GetBytes($"{parts[0]}.{parts[1]}"), Base64Url.Decode(parts[2]), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1))
+        {
+            return null;
+        }
+
+        using var payload = JsonDocument.Parse(Base64Url.Decode(parts[1]));
+        var root = payload.RootElement;
+
+        // An access token also has an sid, but it is not meant for this, so only id_tokens (which have no client_id claim) are accepted
+        if (root.TryGetProperty("client_id", out _) || root.GetProperty("iss").GetString() != IssuerFor(request))
+        {
+            return null;
+        }
+
+        string? audience = root.GetProperty("aud").ValueKind == JsonValueKind.String ? root.GetProperty("aud").GetString() : null;
+        string? sid = root.TryGetProperty("sid", out var sidElement) ? sidElement.GetString() : null;
+        if (audience == null || sid == null || await clients.FindAsync(audience) == null)
+        {
+            return null;
+        }
+
+        return new LogoutHint(audience, sid);
+    }
+    catch (Exception ex) when (ex is FormatException or JsonException or KeyNotFoundException or InvalidOperationException or CryptographicException)
+    {
+        return null;
     }
 }
 
-// 5. Admin page: shows the roles the IdP returns for users and lets an administrator edit the group-to-role mappings
+// 5. Admin page: shows the roles the IdP returns for users, lets an administrator edit the group-to-role mappings,
+// and end a user's sign-ins
 async Task<(IdpUser? User, IResult? Stop)> AdminSignInAsync(HttpContext ctx)
 {
     if (!idp.EnableAdminUi)
@@ -540,15 +711,19 @@ async Task<(IdpUser? User, IResult? Stop)> AdminSignInAsync(HttpContext ctx)
 }
 
 // Persona mode is a development convenience, so anyone using it may edit. Windows mode needs membership in AdminGroup.
-bool CanEditMappings(IdpUser? windowsUser) =>
+bool CanEdit(IdpUser? windowsUser) =>
     !windowsMode || (windowsUser != null && !string.IsNullOrWhiteSpace(idp.AdminGroup) && windowsUser.IsInGroup(idp.AdminGroup));
 
-List<UserReport> BuildReports(IdpUser? windowsUser)
+async Task<List<UserReport>> BuildReportsAsync(IdpUser? windowsUser)
 {
-    var mappings = roleMappings.Snapshot();
+    var mappings = await roleMappings.SnapshotAsync();
     var users = windowsMode ? new List<IdpUser> { windowsUser! } : idp.Personas.Select(IdpUsers.FromPersona).ToList();
     return users.Select(u => IdpUsers.Report(u, mappings)).ToList();
 }
+
+// Other people's sign-ins are only shown to someone who could end them
+async Task<IReadOnlyList<ActiveSession>?> SessionsForAsync(IdpUser? windowsUser) =>
+    CanEdit(windowsUser) ? await refreshStore.ListActiveSessionsAsync() : null;
 
 app.MapGet("/admin/roles", async (HttpContext ctx, IAntiforgery antiforgery, string? notice) =>
 {
@@ -558,7 +733,8 @@ app.MapGet("/admin/roles", async (HttpContext ctx, IAntiforgery antiforgery, str
         return stop;
     }
 
-    var html = AdminPage.Render(idp.AuthenticationMode, BuildReports(user), roleMappings.Snapshot(), CanEditMappings(user), idp.AdminGroup, antiforgery.GetAndStoreTokens(ctx), notice);
+    var html = AdminPage.Render(idp.AuthenticationMode, await BuildReportsAsync(user), await roleMappings.SnapshotAsync(), await SessionsForAsync(user),
+        CanEdit(user), idp.AdminGroup, antiforgery.GetAndStoreTokens(ctx), notice);
     return Results.Content(html, "text/html");
 });
 
@@ -573,13 +749,15 @@ app.MapGet("/admin/roles.json", async (HttpContext ctx) =>
     return Results.Json(new
     {
         mode = idp.AuthenticationMode.ToString(),
-        canEdit = CanEditMappings(user),
-        users = BuildReports(user),
-        roleMappings = roleMappings.Snapshot()
+        canEdit = CanEdit(user),
+        users = await BuildReportsAsync(user),
+        roleMappings = await roleMappings.SnapshotAsync(),
+        sessions = await SessionsForAsync(user)
     }, indented);
 });
 
-async Task<IResult> EditMappingAsync(HttpContext ctx, IAntiforgery antiforgery, bool add)
+// Every admin change goes through here: it must come from an admin, and from our own page (a browser sends Windows credentials by itself)
+async Task<IResult> AdminPostAsync(HttpContext ctx, IAntiforgery antiforgery, Func<IFormCollection, IdpUser?, Task<string>> action)
 {
     var (user, stop) = await AdminSignInAsync(ctx);
     if (stop != null)
@@ -587,12 +765,11 @@ async Task<IResult> EditMappingAsync(HttpContext ctx, IAntiforgery antiforgery, 
         return stop;
     }
 
-    if (!CanEditMappings(user))
+    if (!CanEdit(user))
     {
         return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
 
-    // A browser sends Windows credentials automatically, so edits must also prove they came from our own page
     try
     {
         await antiforgery.ValidateRequestAsync(ctx);
@@ -603,24 +780,48 @@ async Task<IResult> EditMappingAsync(HttpContext ctx, IAntiforgery antiforgery, 
     }
 
     var form = await ctx.Request.ReadFormAsync();
+    string notice = await action(form, user);
+    return Results.Redirect("/admin/roles?notice=" + Uri.EscapeDataString(notice));
+}
+
+async Task<string> EditMappingAsync(IFormCollection form, IdpUser? user, bool add)
+{
     var mapping = new RoleMapping { Group = form["group"].ToString().Trim(), Role = form["role"].ToString().Trim() };
-    string? error = add ? roleMappings.Add(mapping) : roleMappings.Remove(mapping);
+    string? error = add ? await roleMappings.AddAsync(mapping) : await roleMappings.RemoveAsync(mapping);
 
     if (error == null)
     {
         app.Logger.LogInformation("Role mapping {Action} by {Editor}: {Group} -> {Role}", add ? "added" : "removed", user?.Account ?? "persona-mode", mapping.Group, mapping.Role);
     }
 
-    return Results.Redirect("/admin/roles?notice=" + Uri.EscapeDataString(error ?? (add ? "Mapping added." : "Mapping removed.")));
+    return error ?? (add ? "Mapping added." : "Mapping removed.");
 }
 
-app.MapPost("/admin/roles/mappings", (HttpContext ctx, IAntiforgery antiforgery) => EditMappingAsync(ctx, antiforgery, add: true));
-app.MapPost("/admin/roles/mappings/delete", (HttpContext ctx, IAntiforgery antiforgery) => EditMappingAsync(ctx, antiforgery, add: false));
+async Task<string> RevokeSessionsAsync(IFormCollection form, IdpUser? user)
+{
+    string subject = form["subject"].ToString();
+    if (subject == "")
+    {
+        return "Choose a user.";
+    }
 
-IResult? ValidateAuthorizationRequest(string clientId, string redirectUri, string codeChallengeMethod, string? resource)
+    int ended = await refreshStore.RevokeBySubjectAsync(subject);
+    app.Logger.LogInformation("Sessions revoked by {Editor} for {Subject}: {Count} sign-in(s)", user?.Account ?? "persona-mode", subject, ended);
+    return $"Ended {ended} sign-in(s). Access tokens already issued keep working for up to {accessTokenSeconds} seconds.";
+}
+
+app.MapPost("/admin/roles/mappings", (HttpContext ctx, IAntiforgery antiforgery) =>
+    AdminPostAsync(ctx, antiforgery, (form, user) => EditMappingAsync(form, user, add: true)));
+app.MapPost("/admin/roles/mappings/delete", (HttpContext ctx, IAntiforgery antiforgery) =>
+    AdminPostAsync(ctx, antiforgery, (form, user) => EditMappingAsync(form, user, add: false)));
+app.MapPost("/admin/roles/sessions/revoke", (HttpContext ctx, IAntiforgery antiforgery) =>
+    AdminPostAsync(ctx, antiforgery, RevokeSessionsAsync));
+
+async Task<IResult?> ValidateAuthorizationRequestAsync(string clientId, string redirectUri, string codeChallengeMethod, string? resource)
 {
     // Unknown client or unregistered redirect: never redirect back, since that would be an open redirect
-    if (!registeredClients.TryGetValue(clientId, out var allowedRedirects) || !allowedRedirects.Contains(redirectUri))
+    var client = await clients.FindAsync(clientId);
+    if (client == null || !client.RedirectUris.Contains(redirectUri))
     {
         return Results.BadRequest(new { error = "invalid_request", error_description = "Unknown client_id or unregistered redirect_uri" });
     }
@@ -650,15 +851,16 @@ bool IsAcceptableRedirectUri(string? uri)
 
 string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
 
-// Structural Token Builder
-string GenerateJwtToken(RSA rsa, string issuer, string audience, AuthFlowSession user, Dictionary<string, object>? extraClaims = null)
+// Structural Token Builder. sid ties the token to the sign-in it came from, so a logout can end that sign-in.
+string GenerateJwtToken(SigningKey key, string issuer, string audience, AuthFlowSession user, string sid, Dictionary<string, object>? extraClaims = null)
 {
-    var header = new { alg = "RS256", typ = "JWT", kid };
+    var header = new { alg = "RS256", typ = "JWT", kid = key.Kid };
     var payload = new Dictionary<string, object>
     {
         ["iss"] = issuer,
         ["jti"] = Guid.NewGuid().ToString("N"), // unique per token, so two tokens issued in the same second still differ
         ["sub"] = user.Subject,
+        ["sid"] = sid,
         ["aud"] = audience,
         ["exp"] = DateTimeOffset.UtcNow.AddSeconds(accessTokenSeconds).ToUnixTimeSeconds(),
         ["iat"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -671,27 +873,16 @@ string GenerateJwtToken(RSA rsa, string issuer, string audience, AuthFlowSession
         payload[claim.Key] = claim.Value;
     }
 
-    string encodedHeader = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(header)));
-    string encodedPayload = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload)));
+    string encodedHeader = Base64Url.Encode(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(header)));
+    string encodedPayload = Base64Url.Encode(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload)));
 
     string stringToSign = $"{encodedHeader}.{encodedPayload}";
-    byte[] signatureBytes = rsa.SignData(Encoding.UTF8.GetBytes(stringToSign), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+    byte[] signatureBytes = key.Rsa.SignData(Encoding.UTF8.GetBytes(stringToSign), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
 
-    return $"{stringToSign}.{Base64UrlEncode(signatureBytes)}";
+    return $"{stringToSign}.{Base64Url.Encode(signatureBytes)}";
 }
-
-string Base64UrlEncode(byte[] input) => Convert.ToBase64String(input).Replace("=", "").Replace("+", "-").Replace("/", "_");
 
 app.Run();
 
-// Data container for active login loops
-record AuthFlowSession(string ClientId, string RedirectUri, string CodeChallenge, string Subject, string Account, string Name, string[] Roles, string? Resource, string? Scope);
-
-// A refresh token as the IdP remembers it. Used flips to true the one time it is exchanged.
-class RefreshRecord(AuthFlowSession session, string familyId, DateTimeOffset expiresAt)
-{
-    public AuthFlowSession Session { get; } = session;
-    public string FamilyId { get; } = familyId;
-    public DateTimeOffset ExpiresAt { get; } = expiresAt;
-    public bool Used { get; set; }
-}
+// The client and sign-in a logout request's id_token_hint points at
+record LogoutHint(string ClientId, string Sid);

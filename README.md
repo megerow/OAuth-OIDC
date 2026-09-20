@@ -10,9 +10,9 @@ Everything is a **mock for learning**. State is in memory, passwords are plainte
 |---|---|---|---|
 | **MiniOidcService** | Console app | n/a | Step-zero demo: builds and signs a JWT with a fresh RSA key and prints it (paste into jwt.io). Standalone, not used by the others. |
 | **MiniOidcServiceWeb** | ASP.NET minimal API | `http://localhost:5121` | The **identity provider**. Shows a login form, issues signed JWTs, publishes its public keys and metadata, and supports dynamic client registration. |
-| **MiniOidcIdp** | ASP.NET minimal API | `http://localhost:5121` | An alternative **identity provider** with pluggable sign-in (fake users, or Windows authentication) and group-to-role mapping you can edit in a browser. Same endpoints as MiniOidcServiceWeb, so run one or the other. See [MiniOidcIdp](#minioidcidp-role-mapping-and-windows-sign-in). |
+| **MiniOidcIdp** | ASP.NET minimal API | `http://localhost:5121` | An alternative **identity provider** with pluggable sign-in (fake users, or Windows authentication), group-to-role mapping you can edit in a browser, token revocation and logout, and optional storage of its state in SQLite or SQL Server. Same core endpoints as MiniOidcServiceWeb, so run one or the other. See [MiniOidcIdp](#minioidcidp-role-mapping-and-windows-sign-in). |
 | **MiniOidcClient** | Console app | listens on `http://localhost:8080/callback/` | A **client application**. Opens your browser to log in, catches the redirect, exchanges the code for tokens, then calls the protected API. |
-| **MiniFlaskClient** | Python Flask app | `http://localhost:8080` | A web **client application** in Python. Signs you in through the IdP (authorization code + PKCE, ID token checked against the IdP's keys), calls the API's three endpoints with the access token, and shows each result. It asks for a refresh token and renews the access token before it expires. Shares port 8080 with MiniOidcClient, so run one at a time. |
+| **MiniFlaskClient** | Python Flask app | `http://localhost:8080` | A web **client application** in Python. Signs you in through the IdP (authorization code + PKCE, ID token checked against the IdP's keys), calls the API's three endpoints with the access token, and shows each result. It asks for a refresh token, renews the access token before it expires, and on sign-out revokes the refresh token and logs out at the IdP. Shares port 8080 with MiniOidcClient, so run one at a time. |
 | **MiniProtectedApi** | ASP.NET minimal API | `http://localhost:5062` | A **resource server**. Validates bearer tokens from the identity provider and enforces roles. |
 | **MiniMcpServer** | ASP.NET MCP server | `http://localhost:5046/mcp` | A protected **MCP server** (Streamable HTTP). Same token validation, plus the discovery documents MCP clients need. |
 
@@ -82,6 +82,35 @@ flowchart LR
 
 The refresh token is single-use. Step 11 hands back a new one, and the client must keep that and throw the old one away. If an old one is ever presented again, the IdP treats it as stolen and cancels every refresh token from that sign-in, so the user has to sign in again. The [Refresh token flow](#refresh-token-flow) section below shows this in detail.
 
+**Steps 14-15: revoking a refresh token (back channel)**
+
+When a user signs out, the client tells the IdP to cancel its refresh token. This is MiniOidcIdp only, since MiniOidcServiceWeb has no revocation endpoint.
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 90, "rankSpacing": 160, "padding": 25}}}%%
+flowchart LR
+    Client["Client<br/>MiniFlaskClient"]
+    IdP["Identity provider<br/>MiniOidcIdp :5121"]
+
+    Client -- "14. POST /revoke<br/>token=refresh_token, client_id" --> IdP
+    IdP -- "15. 200 (also for an unknown token,<br/>so nothing is revealed)" --> Client
+```
+
+**Steps 16-19: logging out through the browser (front channel)**
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 90, "rankSpacing": 160, "padding": 25}}}%%
+flowchart LR
+    Client["Client<br/>MiniFlaskClient"]
+    User(["User in browser"])
+    IdP["Identity provider<br/>MiniOidcIdp :5121"]
+
+    Client -- "16. 302 redirect to the IdP's<br/>end_session_endpoint" --> User
+    User -- "17. GET /logout?id_token_hint,<br/>client_id, post_logout_redirect_uri, state" --> IdP
+    IdP -- "18. 302 redirect to<br/>post_logout_redirect_uri?state=..." --> User
+    User -- "19. GET /?state=... on the client" --> Client
+```
+
 ## Identity provider endpoints (MiniOidcServiceWeb)
 
 | Endpoint | Purpose |
@@ -124,6 +153,80 @@ Other differences: the token `sub` is the user's SID, and a `preferred_username`
 
 **Testing status:** Persona mode is tested (roles, editing, persistence, and against MiniProtectedApi and MiniMcpServer unchanged). The two Windows modes compile but have not been run, because that needs a Windows machine. On a non-Windows machine they refuse to start.
 
+**More endpoints in MiniOidcIdp** (beyond those above):
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /revoke` | Token revocation (RFC 7009). Hand back a refresh token and every refresh token from that sign-in stops working. Unknown, expired, repeated or another client's tokens all answer 200, so nothing is revealed. An unknown `client_id` gets 400 `invalid_client`, and an access token gets 400 `unsupported_token_type`. |
+| `GET` or `POST /logout` | Logout (OpenID Connect RP-Initiated Logout). Send the `id_token` as `id_token_hint`. Its signature is checked (even if expired), and the sign-in named by its `sid` claim is ended. The browser is redirected to `post_logout_redirect_uri` (with `state`) only if that address is registered for the client. Without a valid hint nothing is ended and nobody is redirected. |
+| `GET /admin/roles` | The admin page, now with an **Active sign-ins** section listing who holds refresh tokens, and an **End sign-ins** button per user. |
+
+Registered clients can be fixed in configuration (`Idp:Clients`, each with `RedirectUris` and `PostLogoutRedirectUris`) or register themselves at `/register`, which also accepts `post_logout_redirect_uris`. Set `Idp:AllowDynamicClientRegistration` to `false` to turn `/register` off (recommended once the IdP holds real data, since it is open to anyone). Registration is limited to 10 addresses per client, 2048 characters each, and 1000 dynamic clients.
+
+## Keeping state in a database (SQLite or SQL Server)
+
+By default MiniOidcIdp keeps everything in memory, so a restart invalidates every token, forgets registered clients and signs everyone out. Setting `Persistence:Provider` to `Sqlite` or `SqlServer` keeps that state in a database instead, so it survives restarts and several IdP servers can share it.
+
+| State | Stored as |
+|---|---|
+| Signing keys | The private key encrypted with AES-GCM, using the key you supply. Several rows during a rotation. |
+| Authorization codes | Only a SHA-256 hash of the code, expiring after 5 minutes |
+| Refresh tokens | Only a SHA-256 hash of the token, with the sign-in it belongs to |
+| Dynamically registered clients | As registered. Clients fixed in `Idp:Clients` stay in configuration. |
+| Role mappings | Seeded once from configuration, then edited on the admin page |
+| ASP.NET Data Protection keys | So the admin page's anti-forgery tokens work on every server |
+
+**Turning it on** (SQLite example):
+
+```bash
+export Persistence__Provider=Sqlite
+export Persistence__ConnectionString="Data Source=/var/lib/miniidp/idp.db"
+export Persistence__EncryptionKey="$(openssl rand -base64 32)"   # generate ONCE and keep it, see below
+dotnet run --project MiniOidcIdp --urls http://localhost:5121
+```
+
+For SQL Server use `Provider=SqlServer` and an ordinary connection string. The schema is created and updated on startup (`Persistence:AutoMigrate`, on by default).
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `Persistence:Provider` | `None` (memory), `Sqlite` or `SqlServer` | `None` |
+| `Persistence:ConnectionString` | The database | none |
+| `Persistence:EncryptionKey` | 32 random bytes, base64. **Required** with a database | none |
+| `Persistence:AutoMigrate` | Apply schema changes at startup. When `false`, startup stops if migrations are pending | `true` |
+| `Persistence:SigningKeyRotationDays` | A new signing key is added when the newest is this old | 90 |
+| `Persistence:SigningKeyRetentionDays` | An old key stays published this long after it is replaced, so tokens it signed still verify | 7 |
+| `Persistence:CleanupIntervalSeconds` | How often expired codes, tokens and keys are removed | 600 |
+| `Tokens:AuthorizationCodeSeconds` | How long a code can be redeemed (also applies without a database) | 300 |
+| `Tokens:RefreshTokenMaxSeconds` | Absolute limit on a sign-in's refresh chain, counted from the original sign-in, however often it is used | 604800 (7 days) |
+| `Idp:Issuer` | A fixed issuer for tokens and metadata. Without it the issuer comes from the request address | none |
+
+**The encryption key is as important as the database.** It protects the private signing key. Keep it in an environment variable or a secret store, never in `appsettings.json` or git. Back it up separately from the database. If it is lost, or replaced with a different one, the IdP refuses to start rather than quietly make a new key, because a new key would make every token already issued stop validating.
+
+**How several servers cooperate.** They share the database, so any server can redeem a code or refresh token another issued. Whichever request removes a code (or marks a refresh token used) first wins, and a simultaneous second attempt is refused. A new signing key waits two minutes before it signs, so every server has published it first. The JWKS lists every stored key. Set `Idp:Issuer` to the one public address of the IdP, because the issuer must be identical whichever server answers, and resource servers' `Auth:Authority` must match it. SQLite works for several processes on one machine, but not across machines (it needs a local disk). Use SQL Server for several IIS servers.
+
+**Schema changes.** The schema is managed with EF Core migrations, one set for each provider. To apply schema changes yourself instead of at startup (often preferred for SQL Server, where the app's account may not be allowed to change the schema), set `AutoMigrate` to `false` and run the generated script:
+
+```bash
+dotnet tool install --global dotnet-ef --version 10.0.12
+cd MiniOidcIdp
+dotnet ef migrations script --idempotent --context SqlServerIdpDbContext -o schema.sql
+# after changing the model, add a migration for each provider:
+dotnet ef migrations add SomeName --context SqliteIdpDbContext    --output-dir Persistence/Migrations/Sqlite
+dotnet ef migrations add SomeName --context SqlServerIdpDbContext --output-dir Persistence/Migrations/SqlServer
+```
+
+**Testing status.** Tested against SQLite: restart survival, secrets stored only as hashes or ciphertext, a wrong encryption key stopping startup, two IdP processes sharing one database (including 20 simultaneous requests for one code and one refresh token, which produced exactly one success each), key rotation and retention, expiry and cleanup. **The SQL Server provider has only been compiled and its generated SQL script reviewed. It has not been run against a SQL Server**, so try it on a test database first.
+
+**Before using it for real tokens**, beyond the settings above:
+
+- Use `WindowsIis` or `WindowsKestrel` sign-in. Persona mode has plaintext passwords and is for development only.
+- Serve it over HTTPS, and set `Idp:Issuer` to that address.
+- Turn off `Idp:AllowDynamicClientRegistration` and list your applications in `Idp:Clients`.
+- Set `Idp:AdminGroup` so only administrators can use the admin page, and turn the page off (`Idp:EnableAdminUi`) if you don't need it.
+- Keep `Tokens:AccessTokenSeconds` short. Revoking a sign-in stops refreshing, but an access token already issued works until it expires.
+- The Data Protection keys stored in the database are not encrypted. They only protect the admin page's anti-forgery tokens, but limit who can read the database.
+- Still missing: login rate limiting or lockout, token introspection, logout notifications to other applications, and encryption-key rotation.
+
 ## Tokens
 
 | Token | Audience (`aud`) | Purpose |
@@ -132,9 +235,9 @@ Other differences: the token `sub` is the user's SID, and a `preferred_username`
 | `access_token` | the `resource` the client asked for (falls back to `client_id`) | What an API or MCP server should accept. Audience binding stops a token for one service being replayed at another. |
 | `refresh_token` | only the IdP's `/token` endpoint | Swaps for a new access token when the old one expires. Issued only when the client asked for `offline_access`. |
 
-The `id_token` and `access_token` are RS256 JWTs carrying `iss`, `jti` (unique per token), `sub`, `name`, `preferred_username` (MiniOidcIdp only), `roles`, `exp`, `iat`. The access token also carries `client_id` and `scope`. The `offline_access` scope only asks for a refresh token, so it is left out of the access token's own `scope` claim.
+The `id_token` and `access_token` are RS256 JWTs carrying `iss`, `jti` (unique per token), `sub`, `sid` (the sign-in the token belongs to, used by logout), `name`, `preferred_username` (MiniOidcIdp only), `roles`, `exp`, `iat`. The access token also carries `client_id` and `scope`. The `offline_access` scope only asks for a refresh token, so it is left out of the access token's own `scope` claim.
 
-**Lifetimes:** the access token and ID token last 1 hour. The refresh token lasts 24 hours and is *sliding*: every refresh returns a new refresh token with a fresh 24 hours, so a client that keeps refreshing stays signed in.
+**Lifetimes:** the access token and ID token last 1 hour. The refresh token lasts 24 hours and is *sliding*: every refresh returns a new refresh token with a fresh 24 hours, so a client that keeps refreshing stays signed in, but only up to an absolute cap of 7 days from the original sign-in (`Tokens:RefreshTokenMaxSeconds`), after which the user must sign in again.
 
 **The refresh token is opaque:** a random string (`rt_...`), not a JWT. Only the IdP can say what it means, and it lives in the IdP's memory, so restarting the IdP invalidates every refresh token.
 
@@ -150,6 +253,7 @@ The `id_token` and `access_token` are RS256 JWTs carrying `iss`, `jti` (unique p
 | Default refresh token lifetime | 24 hours, sliding | 90 days sliding (24 hours for single-page apps) | unlimited, but expires after 7 days unused (configurable) |
 | Default access token lifetime | 1 hour | 60 to 90 minutes | 1 hour |
 | Error for a bad refresh token | `invalid_grant` | `invalid_grant` | `invalid_grant` |
+| Token revocation endpoint (RFC 7009) | yes, revokes the whole sign-in's refresh tokens | to my knowledge, no. Sign-out and administrator session revocation are used instead | yes |
 
 Two differences to know about. This repo is stricter than Entra about a replayed token, and has no grace period, so a client that saves the new token badly or refreshes twice at once gets signed out. Also, when the IdP re-reads a user's roles at refresh time is up to the IdP: this repo does it in Persona mode (edit a mapping and the next refresh has the new roles) but not in Windows modes, which cannot re-read groups without the user's browser sign-in. The vendor docs I checked don't say what Entra and Okta do.
 
@@ -278,6 +382,42 @@ What each side does:
 - **IdP:** a refresh request may ask for the same or fewer scopes than were granted, never more, and a bad request does not use up the token. Every failure looks the same (`invalid_grant`, "invalid, expired or revoked") so a caller learns nothing about which tokens exist.
 - **Resource servers:** nothing changes. They only ever see access tokens, and never a refresh token.
 
+## Sign-out and revocation flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant U as User (browser)
+    participant I as Identity provider
+    participant A as Administrator
+
+    Note over C,I: Back channel: the client cancels its refresh token
+    C->>I: POST /revoke with token=refresh_token and client_id
+    I->>I: cancel that sign-in's tokens
+    I-->>C: 200 (the same answer for an unknown token)
+
+    Note over C,I: Front channel: the browser visits the IdP's logout
+    C->>U: 302 redirect to the IdP's end_session_endpoint
+    U->>I: GET /logout with id_token_hint, client_id, post_logout_redirect_uri, state
+    I->>I: verify the hint, read its sid
+    I->>I: end the sign-in named by sid
+    I-->>U: 302 to post_logout_redirect_uri with state, if that address is registered
+    U->>C: GET the client with state
+    C->>C: check state, show signed out
+
+    Note over A,I: An administrator ends a user's sign-ins
+    A->>I: POST /admin/roles/sessions/revoke with the anti-forgery token and the user
+    I->>I: cancel all of that user's tokens
+    I-->>A: 302 back to the admin page
+```
+
+What this does and does not do:
+- **It stops renewal, not tokens already issued.** After a sign-in is ended the client cannot get new access tokens, but the access token it holds works until it expires (an hour by default, `Tokens:AccessTokenSeconds`). Keep it short if that matters.
+- **A bad hint ends nothing.** A hint with a wrong signature, the wrong client, an access token instead of an `id_token`, or no hint at all just shows a "signed out" page. Nobody is redirected unless the address is registered for the client.
+- **Windows sign-in is not undone.** With `WindowsIis` or `WindowsKestrel` the IdP cannot sign the user out of Windows, so opening an application again signs them straight back in. Logout only ends the tokens.
+- **Ending a user's sign-ins from the admin page** is the way to cut off someone who left or was disabled, since the IdP cannot see that change in Windows on its own.
+
 ## Authorization flow
 
 Every call to a resource server goes through the same checks.
@@ -329,7 +469,7 @@ python3 -m venv .venv
 .venv/bin/python app.py                       # Windows: .venv\Scripts\python app.py
 ```
 
-Open `http://localhost:8080`, choose **Sign in and call the API**, and the results page shows who you are, your roles, and the status of each endpoint. The page also shows whether a refresh token is held and how many times the tokens have been refreshed, with a **Refresh tokens now** button to force one. It is configured with environment variables: `IDP_BASE_URL`, `API_BASE_URL`, `CLIENT_ID`, `REDIRECT_URI`, `PORT`, `SCOPE` (default `openid profile offline_access`), `REFRESH_MARGIN_SECONDS` (default 60) and `FLASK_SECRET_KEY`. The redirect URI must be registered with the IdP, and only `http://localhost:8080/callback/` is pre-registered, so changing the port also needs a new registration.
+Open `http://localhost:8080`, choose **Sign in and call the API**, and the results page shows who you are, your roles, and the status of each endpoint. The page also shows whether a refresh token is held and how many times the tokens have been refreshed, with a **Refresh tokens now** button to force one. It is configured with environment variables: `IDP_BASE_URL`, `API_BASE_URL`, `CLIENT_ID`, `REDIRECT_URI`, `PORT`, `SCOPE` (default `openid profile offline_access`), `REFRESH_MARGIN_SECONDS` (default 60), `POST_LOGOUT_REDIRECT_URI` (default `http://localhost:8080/`, which must be registered for the client) and `FLASK_SECRET_KEY`. **Sign out** revokes the refresh token at the IdP and sends the browser through the IdP's logout page, and against an IdP without those endpoints (MiniOidcServiceWeb) it just clears the local session. The redirect URI must be registered with the IdP, and only `http://localhost:8080/callback/` is pre-registered, so changing the port also needs a new registration.
 
 To use the MCP server from Claude Code:
 
@@ -341,8 +481,8 @@ Then start a new conversation, run `/mcp`, select `mini-oidc` and choose **Authe
 
 ## Limitations
 
-- **In-memory state:** restarting the identity provider forgets registered clients and pending codes, and generates a new signing key. Resource servers refetch keys within about 5 seconds, so the first call after a restart can fail once.
-- **Refresh tokens are basic.** They are kept in the IdP's memory (a restart signs everyone out), there is no revocation or logout endpoint, no grace period for a replayed token, and no client authentication (public clients only). MiniOidcClient does not use them.
+- **In-memory state (the default):** restarting the identity provider forgets registered clients and pending codes, and generates a new signing key. MiniOidcIdp can keep this in a database instead (see above). Resource servers refetch keys within about 5 seconds, so the first call after a restart can fail once.
+- **Refresh tokens are basic.** By default they are kept in the IdP's memory, so a restart signs everyone out (use a database to avoid that). MiniOidcClient does not use them. A replayed token has no grace period, and there is no token introspection, so a revoked sign-in still works until its access token expires.
 - **Mock security:** plaintext passwords, a hardcoded user list, no consent screen, no rate limiting, plain HTTP on localhost.
 - **MiniOidcClient shortcuts:** it sends no `state` (so no CSRF check), doesn't validate the `id_token`, and uses the `id_token` rather than an access token when calling the API.
 - **`iss` follows the request address** (for example `http://localhost:5121`), so a resource server's authority must use the same address the identity provider was reached at.

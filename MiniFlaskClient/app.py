@@ -17,6 +17,7 @@ IDP_BASE_URL = os.environ.get("IDP_BASE_URL", "http://localhost:5121").rstrip("/
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:5062").rstrip("/")
 CLIENT_ID = os.environ.get("CLIENT_ID", "my_learning_client_app")
 REDIRECT_URI = os.environ.get("REDIRECT_URI", "http://localhost:8080/callback/")
+POST_LOGOUT_REDIRECT_URI = os.environ.get("POST_LOGOUT_REDIRECT_URI", "http://localhost:8080/")  # where the IdP sends the browser after sign-out; must be registered there
 PORT = int(os.environ.get("PORT", "8080"))
 SCOPE = os.environ.get("SCOPE", "openid profile offline_access")  # offline_access is what asks the IdP for a refresh token
 REFRESH_MARGIN_SECONDS = int(os.environ.get("REFRESH_MARGIN_SECONDS", "60"))  # renew this long before the access token expires
@@ -129,6 +130,7 @@ def refresh_tokens(record: dict, force: bool = False) -> bool:
             tokens = response.json()
             if "id_token" in tokens:
                 record["claims"] = validate_id_token(tokens["id_token"], meta)
+                record["id_token"] = tokens["id_token"]
         except (requests.RequestException, jwt.PyJWTError, ValueError) as ex:
             app.logger.warning("Refresh failed: %s: %s", type(ex).__name__, ex)
             return False
@@ -175,7 +177,15 @@ def run_checks(record: dict) -> list:
 
 @app.get("/")
 def home():
-    return render_template("index.html", user=current_user(), idp=IDP_BASE_URL, api=API_BASE_URL, client_id=CLIENT_ID, redirect_uri=REDIRECT_URI, notice=request.args.get("notice"))
+    notice = request.args.get("notice")
+
+    # The IdP sends the browser back here after logout, with the state we gave it
+    returned_state = request.args.get("state")
+    expected_state = session.pop("logout_state", None)
+    if returned_state and expected_state and secrets.compare_digest(returned_state, expected_state):
+        notice = "signed_out"
+
+    return render_template("index.html", user=current_user(), idp=IDP_BASE_URL, api=API_BASE_URL, client_id=CLIENT_ID, redirect_uri=REDIRECT_URI, notice=notice)
 
 
 @app.get("/login")
@@ -246,6 +256,7 @@ def callback():
     SIGNED_IN[sid] = {
         "access_token": tokens["access_token"],
         "refresh_token": tokens.get("refresh_token"),
+        "id_token": tokens["id_token"],
         "claims": claims,
         "expires_at": time.time() + int(tokens.get("expires_in", 3600)),
         "refresh_count": 0,
@@ -299,11 +310,44 @@ def refresh_now():
     return redirect(url_for("home", notice="session_ended"))
 
 
-@app.get("/logout")
+@app.post("/logout")
 def logout():
-    SIGNED_IN.pop(session.get("sid"), None)
+    """Ends the sign-in everywhere it can: revokes the refresh token at the IdP, then (if the IdP offers it) sends the browser through
+    the IdP's own logout page. Against an IdP with neither, this only clears the local session."""
+    sid = session.get("sid")
+    record = SIGNED_IN.pop(sid, None)
     session.clear()
-    return redirect(url_for("home"))
+
+    end_session_url = None
+    if record:
+        try:
+            meta = discovery()
+        except requests.RequestException:
+            meta = {}
+
+        # Back channel: tell the IdP this refresh token must stop working, whatever happens in the browser
+        if record.get("refresh_token") and meta.get("revocation_endpoint"):
+            try:
+                requests.post(
+                    meta["revocation_endpoint"],
+                    data={"token": record["refresh_token"], "token_type_hint": "refresh_token", "client_id": CLIENT_ID},
+                    timeout=HTTP_TIMEOUT,
+                )
+            except requests.RequestException as ex:
+                app.logger.warning("Could not revoke the refresh token: %s", ex)
+
+        # Front channel: the IdP ends the sign-in named in the id_token and sends the browser back with our state
+        if meta.get("end_session_endpoint"):
+            state = b64url(secrets.token_bytes(16))
+            session["logout_state"] = state
+            end_session_url = f"{meta['end_session_endpoint']}?" + urlencode({
+                "id_token_hint": record["id_token"],
+                "client_id": CLIENT_ID,
+                "post_logout_redirect_uri": POST_LOGOUT_REDIRECT_URI,
+                "state": state,
+            })
+
+    return redirect(end_session_url or url_for("home", notice="signed_out"))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ Everything is a **mock for learning**. State is in memory, passwords are plainte
 | **MiniOidcServiceWeb** | ASP.NET minimal API | `http://localhost:5121` | The **identity provider**. Shows a login form, issues signed JWTs, publishes its public keys and metadata, and supports dynamic client registration. |
 | **MiniOidcIdp** | ASP.NET minimal API | `http://localhost:5121` | An alternative **identity provider** with pluggable sign-in (fake users, or Windows authentication) and group-to-role mapping you can edit in a browser. Same endpoints as MiniOidcServiceWeb, so run one or the other. See [MiniOidcIdp](#minioidcidp-role-mapping-and-windows-sign-in). |
 | **MiniOidcClient** | Console app | listens on `http://localhost:8080/callback/` | A **client application**. Opens your browser to log in, catches the redirect, exchanges the code for tokens, then calls the protected API. |
+| **MiniFlaskClient** | Python Flask app | `http://localhost:8080` | A web **client application** in Python. Signs you in through the IdP (authorization code + PKCE, ID token checked against the IdP's keys), calls the API's three endpoints with the access token, and shows each result. It asks for a refresh token and renews the access token before it expires. Shares port 8080 with MiniOidcClient, so run one at a time. |
 | **MiniProtectedApi** | ASP.NET minimal API | `http://localhost:5062` | A **resource server**. Validates bearer tokens from the identity provider and enforces roles. |
 | **MiniMcpServer** | ASP.NET MCP server | `http://localhost:5046/mcp` | A protected **MCP server** (Streamable HTTP). Same token validation, plus the discovery documents MCP clients need. |
 
@@ -43,7 +44,7 @@ flowchart LR
     IdP["Identity provider<br/>MiniOidcServiceWeb :5121"]
 
     Client -- "5. POST /token<br/>code + code_verifier" --> IdP
-    IdP -- "6. 200 response:<br/>access_token + id_token" --> Client
+    IdP -- "6. 200 response: access_token + id_token,<br/>plus refresh_token if offline_access was asked for" --> Client
 ```
 
 **Steps 7-9: calling the protected API or MCP server**
@@ -62,13 +63,32 @@ flowchart LR
 
 Step 8 is a two-way dotted arrow because it is a request and its response. MCP clients also make these calls before step 1: `GET /.well-known/oauth-protected-resource` on the MCP server, then `GET /.well-known/oauth-authorization-server` and `POST /register` on the identity provider. They are shown in the sequence diagram below.
 
+**Steps 10-13: refreshing an access token that is about to expire**
+
+An access token lasts one hour. A client that asked for the `offline_access` scope also received a refresh token, and uses it to get a new access token without sending the user back to the login page. The numbers continue from step 9.
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 90, "rankSpacing": 160, "padding": 25}}}%%
+flowchart LR
+    Client["Client<br/>MiniFlaskClient<br/>or any client that asked<br/>for offline_access"]
+    IdP["Identity provider<br/>MiniOidcServiceWeb or MiniOidcIdp :5121"]
+    RS["Resource server<br/>MiniProtectedApi :5062<br/>or MiniMcpServer :5046"]
+
+    Client -- "10. POST /token<br/>grant_type=refresh_token,<br/>refresh_token, client_id" --> IdP
+    IdP -- "11. 200 response: new access_token,<br/>new refresh_token, id_token" --> Client
+    Client -- "12. GET /api/... or POST /mcp<br/>with the new Bearer token" --> RS
+    RS -- "13. response: 200, 401 or 403" --> Client
+```
+
+The refresh token is single-use. Step 11 hands back a new one, and the client must keep that and throw the old one away. If an old one is ever presented again, the IdP treats it as stolen and cancels every refresh token from that sign-in, so the user has to sign in again. The [Refresh token flow](#refresh-token-flow) section below shows this in detail.
+
 ## Identity provider endpoints (MiniOidcServiceWeb)
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /authorize` | Validates the request (registered client, exact `redirect_uri`, `S256` PKCE) and shows the login form. |
-| `POST /login` | Checks credentials, creates a one-time authorization code, redirects back to the client with `code` and `state`. |
-| `POST /token` | Verifies the PKCE `code_verifier`, burns the code, returns an `access_token` and an `id_token`. |
+| `POST /login` | Checks credentials, creates a one-time authorization code, redirects back to the client with `code` and `state`. A wrong email or password shows the login form again with a generic "Incorrect email or password" message and keeps the request details so the user can retry. |
+| `POST /token` | Two grants. `authorization_code`: verifies the PKCE `code_verifier`, burns the code, returns an `access_token` and an `id_token` (and a `refresh_token` if the request asked for the `offline_access` scope). `refresh_token`: swaps a refresh token for a new set of tokens. |
 | `POST /register` | Dynamic client registration (RFC 7591) for public clients. Accepts https or loopback-http redirect URIs. |
 | `GET /.well-known/openid-configuration` and `/.well-known/oauth-authorization-server` | Metadata: endpoints, supported methods. |
 | `GET /.well-known/jwks.json` | The public signing key. The RSA key is regenerated on every start, so the `kid` changes too. |
@@ -76,6 +96,8 @@ Step 8 is a two-way dotted arrow because it is a request and its response. MCP c
 **Mock users** (password `password123`): `jane.doe@example.com` has roles `Admin` and `BillingManager`. `john.smith@example.com` has only `BillingManager`.
 
 **Pre-registered client:** `my_learning_client_app` with redirect `http://localhost:8080/callback/`.
+
+**Token lifetimes:** both IdPs read `Tokens:AccessTokenSeconds` (default 3600) and `Tokens:RefreshTokenSeconds` (default 86400) from `appsettings.json`. Override with `Tokens__AccessTokenSeconds=6` and so on, which is handy for watching a refresh happen without waiting an hour.
 
 ## MiniOidcIdp: role mapping and Windows sign-in
 
@@ -108,8 +130,28 @@ Other differences: the token `sub` is the user's SID, and a `preferred_username`
 |---|---|---|
 | `id_token` | the client's `client_id` | Tells the client who logged in. MiniOidcClient also sends it to MiniProtectedApi as a shortcut. |
 | `access_token` | the `resource` the client asked for (falls back to `client_id`) | What an API or MCP server should accept. Audience binding stops a token for one service being replayed at another. |
+| `refresh_token` | only the IdP's `/token` endpoint | Swaps for a new access token when the old one expires. Issued only when the client asked for `offline_access`. |
 
-Both are RS256 JWTs carrying `iss`, `sub` (email), `name`, `roles`, `exp`, `iat`. The access token also carries `client_id` and `scope`.
+The `id_token` and `access_token` are RS256 JWTs carrying `iss`, `jti` (unique per token), `sub`, `name`, `preferred_username` (MiniOidcIdp only), `roles`, `exp`, `iat`. The access token also carries `client_id` and `scope`. The `offline_access` scope only asks for a refresh token, so it is left out of the access token's own `scope` claim.
+
+**Lifetimes:** the access token and ID token last 1 hour. The refresh token lasts 24 hours and is *sliding*: every refresh returns a new refresh token with a fresh 24 hours, so a client that keeps refreshing stays signed in.
+
+**The refresh token is opaque:** a random string (`rt_...`), not a JWT. Only the IdP can say what it means, and it lives in the IdP's memory, so restarting the IdP invalidates every refresh token.
+
+**How this compares with Entra ID and Okta** (from their documentation when checked. Confirm the details for your own tenant):
+
+| Behavior | This repo | Entra ID | Okta |
+|---|---|---|---|
+| How a refresh token is requested | `offline_access` scope | `offline_access` scope | `offline_access` scope |
+| Refresh request from a public client | `grant_type`, `refresh_token`, `client_id`, optional `scope` (the same or fewer scopes) | same | same |
+| Refresh token format | opaque | opaque | opaque |
+| Replaced on every use | yes | yes | yes by default (configurable) |
+| An old token used again | revoked immediately, along with every token from that sign-in | the old token is not revoked | revoked with the rest, after a grace period (30 seconds by default) |
+| Default refresh token lifetime | 24 hours, sliding | 90 days sliding (24 hours for single-page apps) | unlimited, but expires after 7 days unused (configurable) |
+| Default access token lifetime | 1 hour | 60 to 90 minutes | 1 hour |
+| Error for a bad refresh token | `invalid_grant` | `invalid_grant` | `invalid_grant` |
+
+Two differences to know about. This repo is stricter than Entra about a replayed token, and has no grace period, so a client that saves the new token badly or refreshes twice at once gets signed out. Also, when the IdP re-reads a user's roles at refresh time is up to the IdP: this repo does it in Persona mode (edit a mapping and the next refresh has the new roles) but not in Windows modes, which cannot re-read groups without the user's browser sign-in. The vendor docs I checked don't say what Entra and Okta do.
 
 ## Protected resources
 
@@ -165,7 +207,7 @@ Illustrative values for other providers (verify in your tenant, since these depe
 }
 ```
 
-Config alone is not the whole swap. MiniOidcClient still has the mock IdP's endpoints, client ID and redirect URI hardcoded and sends the `id_token` to the API, and MCP clients expect dynamic client registration that real providers often restrict. `RequireHttpsMetadata` and `MetadataRefreshSeconds` should be removed from the API and MCP `appsettings.json` when you switch.
+Config alone is not the whole swap. Request the `offline_access` scope if you want a refresh token from Entra ID or Okta. MiniOidcClient still has the mock IdP's endpoints, client ID and redirect URI hardcoded and sends the `id_token` to the API, and MCP clients expect dynamic client registration that real providers often restrict. `RequireHttpsMetadata` and `MetadataRefreshSeconds` should be removed from the API and MCP `appsettings.json` when you switch.
 
 ## Authentication flow
 
@@ -191,7 +233,7 @@ sequenceDiagram
 
     Note over C,I: Authorization code with PKCE
     C->>C: create code_verifier, code_challenge = SHA256 of verifier
-    C->>U: open browser at /authorize with client_id, redirect_uri, code_challenge, resource, state
+    C->>U: open browser at /authorize with client_id, redirect_uri, code_challenge, resource, state, scope (offline_access asks for a refresh token)
     U->>I: GET /authorize
     I-->>U: login form
     U->>I: POST /login with email and password
@@ -200,8 +242,41 @@ sequenceDiagram
     U->>C: GET redirect_uri with code and state (loopback callback)
     C->>I: POST /token with code and code_verifier
     I->>I: check SHA256 of verifier matches stored challenge, burn code
-    I-->>C: access_token (aud = resource) and id_token (aud = client_id)
+    I-->>C: access_token (aud = resource), id_token (aud = client_id), and refresh_token if offline_access was asked for
 ```
+
+## Refresh token flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant I as Identity provider
+    participant R as Resource server
+
+    Note over C,I: At sign-in the client asked for the offline_access scope
+    C->>I: POST /token with code and code_verifier
+    I-->>C: access_token, id_token and refresh_token RT1 (opaque, valid 24 hours)
+
+    Note over C,R: Shortly before the access token expires, one hour later
+    C->>I: POST /token with grant_type=refresh_token, refresh_token=RT1, client_id
+    I->>I: check RT1 is valid and unused, then mark it used
+    I->>I: rebuild the roles from the current mappings
+    I-->>C: new access_token, id_token and refresh_token RT2 (same family, a fresh 24 hours)
+    C->>R: GET /api/... with the new Bearer access token
+    R-->>C: 200
+
+    Note over C,I: If an already-used refresh token is presented again
+    C->>I: POST /token with grant_type=refresh_token, refresh_token=RT1
+    I->>I: RT1 was already used, so revoke the whole family
+    I-->>C: 400 invalid_grant
+    Note over C: The user has to sign in again
+```
+
+What each side does:
+- **Client:** refresh a little before expiry (MiniFlaskClient does this 60 seconds early, set by `REFRESH_MARGIN_SECONDS`). Save the new refresh token every time. Never send the same refresh token twice, and never from two threads at once. If the IdP answers `invalid_grant`, send the user to sign in again.
+- **IdP:** a refresh request may ask for the same or fewer scopes than were granted, never more, and a bad request does not use up the token. Every failure looks the same (`invalid_grant`, "invalid, expired or revoked") so a caller learns nothing about which tokens exist.
+- **Resource servers:** nothing changes. They only ever see access tokens, and never a refresh token.
 
 ## Authorization flow
 
@@ -245,6 +320,17 @@ To use MiniOidcIdp instead, start it in place of MiniOidcServiceWeb (both use po
 
 The client prints the token response, then the result of `/api/public`, `/api/admin-dashboard` and `/api/billing`.
 
+To try the Python client instead of MiniOidcClient (needs Python 3.10 or newer):
+
+```bash
+cd MiniFlaskClient
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt     # Windows: .venv\Scripts\pip
+.venv/bin/python app.py                       # Windows: .venv\Scripts\python app.py
+```
+
+Open `http://localhost:8080`, choose **Sign in and call the API**, and the results page shows who you are, your roles, and the status of each endpoint. The page also shows whether a refresh token is held and how many times the tokens have been refreshed, with a **Refresh tokens now** button to force one. It is configured with environment variables: `IDP_BASE_URL`, `API_BASE_URL`, `CLIENT_ID`, `REDIRECT_URI`, `PORT`, `SCOPE` (default `openid profile offline_access`), `REFRESH_MARGIN_SECONDS` (default 60) and `FLASK_SECRET_KEY`. The redirect URI must be registered with the IdP, and only `http://localhost:8080/callback/` is pre-registered, so changing the port also needs a new registration.
+
 To use the MCP server from Claude Code:
 
 ```bash
@@ -256,7 +342,7 @@ Then start a new conversation, run `/mcp`, select `mini-oidc` and choose **Authe
 ## Limitations
 
 - **In-memory state:** restarting the identity provider forgets registered clients and pending codes, and generates a new signing key. Resource servers refetch keys within about 5 seconds, so the first call after a restart can fail once.
-- **No refresh tokens.** Tokens last one hour, then the client must log in again.
+- **Refresh tokens are basic.** They are kept in the IdP's memory (a restart signs everyone out), there is no revocation or logout endpoint, no grace period for a replayed token, and no client authentication (public clients only). MiniOidcClient does not use them.
 - **Mock security:** plaintext passwords, a hardcoded user list, no consent screen, no rate limiting, plain HTTP on localhost.
 - **MiniOidcClient shortcuts:** it sends no `state` (so no CSRF check), doesn't validate the `id_token`, and uses the `id_token` rather than an access token when calling the API.
 - **`iss` follows the request address** (for example `http://localhost:5121`), so a resource server's authority must use the same address the identity provider was reached at.

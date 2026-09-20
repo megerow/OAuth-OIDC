@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}API results - MiniFlaskClient{% endblock %}
+{% block body %}
+  <h1>API results</h1>
+  {% if notice == 'refreshed' %}<p class="notice">Tokens refreshed: the IdP issued a new access token and a new refresh token.</p>{% endif %}
+
+  <h3>Signed in</h3>
+  <table>
+    <tr><th>Name</th><td>{{ claims.get('name', '') }}</td></tr>
+    <tr><th>Account</th><td>{{ claims.get('preferred_username', '') }}</td></tr>
+    <tr><th>Subject (<code>sub</code>)</th><td><code>{{ claims.sub }}</code></td></tr>
+    <tr><th>Roles in the token</th><td>
+      {% for role in claims.get('roles', []) %}<span class="role">{{ role }}</span>{% else %}<i>none</i>{% endfor %}
+    </td></tr>
+    <tr><th>Access token expires</th><td>{{ expires_at }}</td></tr>
+    <tr><th>Refresh token</th><td>
+      {% if has_refresh_token %}held. It is swapped for a new access token shortly before this one expires, and the IdP hands back a new refresh token each time.
+      {% else %}<i>none.</i> The IdP did not issue one, so you will have to sign in again when the access token expires.{% endif %}
+    </td></tr>
+    {% if has_refresh_token %}
+    <tr><th>Refreshed so far</th><td>{{ refresh_count }} time(s){% if last_refreshed %}, last at {{ last_refreshed }}{% endif %}</td></tr>
+    {% endif %}
+  </table>
+
+  <h3>Calls to the API</h3>
+  <table>
+    <tr><th>Endpoint</th><th>Expected to admit</th><th>Status</th><th>Result</th><th>Response</th></tr>
+    {% for r in results %}
+    <tr>
+      <td><code>{{ r.path }}</code></td>
+      <td>{{ r.expected }}</td>
+      <td>{{ r.status if r.status is not none else '-' }}</td>
+      <td class="{{ 'ok' if r.status == 200 else ('denied' if r.status in (401, 403) else 'warn') }}">{{ r.verdict }}</td>
+      <td><pre>{{ r.body }}</pre></td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <p>
+    <a class="button" href="{{ url_for('results') }}">Call again</a>
+    {% if has_refresh_token %}<form method="post" action="{{ url_for('refresh_now') }}" style="display:inline"><button class="button" type="submit" style="border:none; cursor:pointer; font-size:1em">Refresh tokens now</button></form>{% endif %}
+    <a class="button secondary" href="{{ url_for('home') }}">Home</a>
+    <a class="button secondary" href="{{ url_for('logout') }}">Sign out</a>
+  </p>
+  <p class="muted">The roles come from the IdP's group mappings. If a change was made since you signed in, sign out and in again to get a new token.</p>
+{% endblock %}

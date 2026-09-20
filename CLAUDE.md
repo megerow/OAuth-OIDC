@@ -14,19 +14,23 @@ A learning sandbox for OAuth 2.0 / OIDC in .NET 10. See [README.md](README.md) f
 | MiniOidcServiceWeb or MiniOidcIdp (run one, not both) | 5121 |
 | MiniProtectedApi | 5062 |
 | MiniMcpServer | 5046 |
-| MiniOidcClient (callback listener) | 8080 |
+| MiniOidcClient or MiniFlaskClient (callback listener; run one at a time) | 8080 |
 
 Start the identity provider first. MiniProtectedApi and MiniMcpServer read an `Auth` section from `appsettings.json` (`Authority`, `Audience`, `RoleClaimType`, and for MCP also `Resource` and `Scopes`). Override with environment variables such as `Auth__Authority`. Token `iss` follows the request address, so the authority must match how the IdP is reached.
 
 ## Habits that saved time
 
 - **Leftover background servers hold ports.** Check with `ss -tlnp | grep -E ':(5121|5062|5046|8080)\b'` and free one with `fuser -k <port>/tcp`. Match the real process name (`MiniOidcService`), not `dotnet`.
+- **Free ports with `fuser -k <port>/tcp`, not `pkill -f '<pattern>'`.** Running `pkill -f` from a shell command that contains the pattern kills the calling shell (exit 144).
 - **Test on temporary ports** so a running instance isn't disturbed: `dotnet run --no-build --urls http://localhost:5400` with `Auth__Authority=...` set for the API and MCP server, plus `Auth__Audience=...` and `Auth__Resource=...` for the MCP server (its default port 5046 is often already taken by a running instance, which makes a new copy fail to start and hides that in test results).
 - The OAuth interop test for the MCP server used the official `ModelContextProtocol` SDK client (`HttpClientTransport` with `ClientOAuthOptions`, dynamic registration, and a redirect delegate that submits the login form). It lived outside the repo and isn't saved here. Rebuild it if needed.
+- **Mind line endings when patching files with a script.** `MiniOidcServiceWeb/appsettings.json` uses CRLF. Python's text mode turns it into LF and inflates the git diff, so open with `newline=''` or use the Edit tool. Check with `git diff --stat`.
+- **Shorten token lifetimes to watch refresh work.** `Tokens__AccessTokenSeconds=6` on an IdP plus `REFRESH_MARGIN_SECONDS=2` on MiniFlaskClient shows the whole cycle in seconds.
 - Mermaid diagrams in the README can be parse-checked with the `mermaid` npm package and rendered with `@mermaid-js/mermaid-cli` using the system Chrome.
 
 ## Status and open items
 
+- Refresh tokens: both IdPs issue them when `offline_access` is requested (opaque, rotated on every use, replay revokes the family, 24 hour sliding lifetime), and MiniFlaskClient uses them. MiniOidcClient and the MCP test client do not. In MiniOidcIdp Windows modes, roles from sign-in are kept across refreshes because groups can't be re-read without a browser sign-in (untested). Not built: a revocation or logout endpoint, a replay grace period, and persistence across IdP restarts.
 - MiniOidcIdp: `Persona` mode is tested. `WindowsKestrel` and `WindowsIis` compile but have **never been run** (needs Windows).
 - Claude Code authenticating to MiniMcpServer through its own OAuth flow has **not been tried**. Only the SDK client has.
 - MiniOidcClient sends the `id_token` to MiniProtectedApi, which is a shortcut. The proper change is to send the `access_token` and give the API its own audience. Not done because it touches two existing projects.

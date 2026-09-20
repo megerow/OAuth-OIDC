@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block body %}
+  <h1>MiniFlaskClient</h1>
+  {% if notice == 'session_ended' %}<p class="notice">Your session ended: the identity provider would not renew it. Sign in again.</p>{% endif %}
+  <p>Signs you in through the identity provider, then calls the protected API's endpoints with your access token and reports what each one says.</p>
+
+  {% if user %}
+    <p>Signed in as <b>{{ user.claims.get('name') or user.claims.get('preferred_username') or user.claims.sub }}</b>.</p>
+    <p><a class="button" href="{{ url_for('results') }}">Call the API</a> <a class="button secondary" href="{{ url_for('logout') }}">Sign out</a></p>
+  {% else %}
+    <p><a class="button" href="{{ url_for('login') }}">Sign in and call the API</a></p>
+  {% endif %}
+
+  <h3>Configuration</h3>
+  <table>
+    <tr><th>Identity provider</th><td><code>{{ idp }}</code></td></tr>
+    <tr><th>Protected API</th><td><code>{{ api }}</code></td></tr>
+    <tr><th>Client ID</th><td><code>{{ client_id }}</code></td></tr>
+    <tr><th>Redirect URI</th><td><code>{{ redirect_uri }}</code></td></tr>
+  </table>
+{% endblock %}
